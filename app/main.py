@@ -53,6 +53,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         code = "conflict"
         if "one_active_booking_per_item" in message:
             code = "item_already_booked"
+        elif "one_checkin_per_staff_per_slot" in message:
+            code = "reception_person_already_used"
         elif "one_accepted_scan_per_label" in message:
             code = "label_already_scanned"
         elif "one_open_box_line_per_item" in message:

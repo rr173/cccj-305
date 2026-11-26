@@ -121,20 +121,73 @@ CREATE TABLE IF NOT EXISTS detail_corrections (
     seq         INTEGER NOT NULL
 );
 
+-- --------------------------------------------------------------------------
+-- Reception slots and duty rosters.
+--
+-- Reception capacity is *shared* between counters: one duty person may be
+-- rostered to serve at several counters during the same slot, but can only
+-- receive one booking in that slot.  A slot is a fixed 30-minute window
+-- starting on a UTC full or half hour.
+-- --------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS slots (
+    id          TEXT PRIMARY KEY,       -- slot_YYYYMMDDTHHMMZ
+    starts_at   TEXT NOT NULL UNIQUE,   -- canonical UTC, seconds precision
+    ends_at     TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+-- The current roster of one slot.  Entries are replaced as a whole by the
+-- roster endpoint; this does not change anybody's home counter or rights.
+CREATE TABLE IF NOT EXISTS slot_rosters (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    slot_id     TEXT NOT NULL REFERENCES slots(id),
+    staff_id    TEXT NOT NULL REFERENCES staff(id),
+    counter_id  TEXT NOT NULL REFERENCES counters(id),
+    set_by      TEXT NOT NULL REFERENCES staff(id),
+    set_at      TEXT NOT NULL,
+    UNIQUE (slot_id, staff_id, counter_id)
+);
+
 CREATE TABLE IF NOT EXISTS bookings (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id      TEXT NOT NULL REFERENCES items(id),
     claimant_id  TEXT NOT NULL REFERENCES claimants(id),
-    status       TEXT NOT NULL,        -- active | cancelled | fulfilled
+    status       TEXT NOT NULL,        -- active | cancelled | fulfilled | expired
     created_by   TEXT NOT NULL REFERENCES staff(id),
     created_at   TEXT NOT NULL,
+    -- NULL only on legacy appointments recorded before slots existed.  Such a
+    -- booking can be given a slot once, or cancelled; it cannot check in or
+    -- be delivered until a slot is assigned.
+    slot_id      TEXT REFERENCES slots(id),
+    -- Counter at which the booking was made / must be received.
+    counter_id   TEXT REFERENCES counters(id),
     ended_at     TEXT,
-    ended_reason TEXT,                 -- staff_cancelled | eligibility_lost
+    ended_reason TEXT,                 -- staff_cancelled | eligibility_lost |
+                                       -- item_dispatched | roster_changed | slot_ended
     seq          INTEGER NOT NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_booking_per_item
     ON bookings(item_id) WHERE status = 'active';
+
+-- Check-in facts: the person at the desk actually received this booking in
+-- this slot.  One person can receive at most one booking per slot, and the
+-- reservation of that person survives delivery/cancellation until the slot
+-- ends (the unique index is the hard guarantee).
+CREATE TABLE IF NOT EXISTS reception_checkins (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    booking_id    INTEGER NOT NULL UNIQUE REFERENCES bookings(id),
+    slot_id       TEXT NOT NULL REFERENCES slots(id),
+    staff_id      TEXT NOT NULL REFERENCES staff(id),
+    counter_id    TEXT NOT NULL REFERENCES counters(id),
+    checked_in_at TEXT NOT NULL,
+    registered_by TEXT NOT NULL REFERENCES staff(id),
+    seq           INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_checkin_per_staff_per_slot
+    ON reception_checkins(slot_id, staff_id);
 
 CREATE TABLE IF NOT EXISTS deliveries (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,7 +198,12 @@ CREATE TABLE IF NOT EXISTS deliveries (
     delivered_at        TEXT NOT NULL,
     private_clue_count  INTEGER NOT NULL,
     eligibility_note    TEXT NOT NULL,
-    seq                 INTEGER NOT NULL
+    seq                 INTEGER NOT NULL,
+    -- Slot processing facts.  NULL for deliveries recorded before slots.
+    booking_id          INTEGER,
+    slot_id             TEXT,
+    reception_staff_id  TEXT,
+    counter_id          TEXT
 );
 
 -- Frozen snapshot of the evidence at delivery.  Never updated afterwards.
@@ -264,6 +322,20 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action  TEXT NOT NULL,
     detail  TEXT NOT NULL
 );
+
+-- Every roster replacement keeps the previous roster for audit: the snapshot
+-- of who was rostered where, and how many un-checked-in bookings the change
+-- cancelled because capacity shrank.
+CREATE TABLE IF NOT EXISTS roster_changes (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    slot_id        TEXT NOT NULL REFERENCES slots(id),
+    version        INTEGER NOT NULL,
+    changed_by     TEXT NOT NULL REFERENCES staff(id),
+    changed_at     TEXT NOT NULL,
+    entry_count    INTEGER NOT NULL,
+    cancelled_bookings TEXT NOT NULL,
+    note           TEXT NOT NULL
+);
 """
 
 
@@ -302,10 +374,13 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """Add transfer columns to databases created before the counter upgrade.
+    """Add counter / custody / slot columns to databases created earlier.
 
     Legacy staff and every item already in the museum are assigned to the
-    main desk.  New databases already contain the columns in ``SCHEMA``.
+    main desk.  Legacy bookings keep their status but have no ``slot_id``;
+    they can be given a slot once or cancelled, but not checked in or
+    delivered until a slot exists.  Legacy delivery history is preserved
+    with empty slot-processing columns.
     """
     staff_cols = _table_columns(conn, "staff")
     if "counter_id" not in staff_cols:
@@ -331,6 +406,17 @@ def migrate(conn: sqlite3.Connection) -> None:
             "UPDATE items SET custody_counter_id = 'cnt_main' "
             "WHERE custody_counter_id IS NULL"
         )
+
+    booking_cols = _table_columns(conn, "bookings")
+    if "slot_id" not in booking_cols:
+        conn.execute("ALTER TABLE bookings ADD COLUMN slot_id TEXT")
+    if "counter_id" not in booking_cols:
+        conn.execute("ALTER TABLE bookings ADD COLUMN counter_id TEXT")
+
+    delivery_cols = _table_columns(conn, "deliveries")
+    for column in ("booking_id", "slot_id", "reception_staff_id", "counter_id"):
+        if column not in delivery_cols:
+            conn.execute(f"ALTER TABLE deliveries ADD COLUMN {column} TEXT")
 
 
 @contextmanager

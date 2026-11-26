@@ -421,7 +421,9 @@ def _cancel_booking_for_dispatch(
 ) -> list[int]:
     """Cancel active bookings because the object entered transit.
 
-    Cancellation is one-way, exactly like eligibility cancellations.
+    Cancellation is one-way, exactly like eligibility cancellations.  An
+    existing check-in remains a historical fact and its person's slot seat
+    stays occupied until the slot ends; only this item's own booking ends.
     """
     cancelled: list[int] = []
     rows = conn.execute(

@@ -296,14 +296,45 @@ def claimant_item_status(
     item = get_item_by_public_code(conn, public_code)
     elig = eligibility(conn, item["id"], claimant_id)
     booking = conn.execute(
-        "SELECT * FROM bookings WHERE item_id = ? AND claimant_id = ? "
-        "ORDER BY id DESC LIMIT 1",
+        "SELECT b.*, s.starts_at AS slot_starts_at, s.ends_at AS slot_ends_at"
+        "  FROM bookings b LEFT JOIN slots s ON s.id = b.slot_id"
+        " WHERE b.item_id = ? AND b.claimant_id = ? ORDER BY b.id DESC LIMIT 1",
         (item["id"], claimant_id),
     ).fetchone()
     delivery = conn.execute(
         "SELECT * FROM deliveries WHERE item_id = ? AND claimant_id = ?",
         (item["id"], claimant_id),
     ).fetchone()
+
+    booking_view: dict[str, Any] | None = None
+    if booking is not None:
+        from .scheduling import booking_slot_brief, effective_booking_ended
+
+        status, ended_reason = effective_booking_ended(booking)
+        counter = None
+        if booking["counter_id"] is not None:
+            row = conn.execute(
+                "SELECT id, code, name FROM counters WHERE id = ?",
+                (booking["counter_id"],),
+            ).fetchone()
+            counter = None if row is None else dict(row)
+        checkin = conn.execute(
+            "SELECT id FROM reception_checkins WHERE booking_id = ?", (booking["id"],)
+        ).fetchone()
+        booking_view = {
+            "id": booking["id"],
+            "status": status,
+            "created_at": booking["created_at"],
+            "ended_at": booking["ended_at"],
+            "ended_reason": ended_reason,
+            # The claimant may see where and when to come, but never the
+            # internal roster or which specific person will receive them
+            # before they actually check in.
+            "counter": counter,
+            "slot": booking_slot_brief(booking),
+            "checked_in": checkin is not None,
+        }
+
     return {
         "public_code": item["public_code"],
         "title": item["title"],
@@ -319,15 +350,7 @@ def claimant_item_status(
             }
             for a in elig["answers"]
         ],
-        "booking": None
-        if booking is None
-        else {
-            "id": booking["id"],
-            "status": booking["status"],
-            "created_at": booking["created_at"],
-            "ended_at": booking["ended_at"],
-            "ended_reason": booking["ended_reason"],
-        },
+        "booking": booking_view,
         "delivered_to_you": delivery is not None,
         "delivered_at": None if delivery is None else delivery["delivered_at"],
     }
@@ -519,9 +542,16 @@ def cancel_lost_bookings(
 
 
 def create_booking(
-    conn: sqlite3.Connection, item_id: str, claimant_id: str, staff_id: str
+    conn: sqlite3.Connection,
+    item_id: str,
+    claimant_id: str,
+    staff_id: str,
+    slot_ref: str,
 ) -> dict[str, Any]:
+    from . import scheduling
+
     with transaction(conn):
+        scheduling.sweep_expired_bookings(conn)
         item = get_item(conn, item_id)
         if item["status"] != "held":
             raise api_error(409, "item_not_held", "该失物已交付，不能再预约")
@@ -532,6 +562,11 @@ def create_booking(
         ).fetchone()
         if claimant is None:
             raise api_error(404, "claimant_not_found", "认领者不存在")
+
+        # Slot format / existence is validated before eligibility so that a
+        # malformed request fails fast and never creates anything.
+        slot = scheduling.resolve_slot(conn, slot_ref, create=True)
+        scheduling.assert_slot_not_ended(slot)
 
         elig = eligibility(conn, item_id, claimant_id)
         if not elig["eligible"]:
@@ -557,19 +592,31 @@ def create_booking(
                 booking_id=active["id"],
             )
 
+        capacity = scheduling.assert_booking_fits(conn, slot, item["custody_counter_id"])
+
         seq = next_seq(conn)
         at = now_iso()
         cur = conn.execute(
-            "INSERT INTO bookings(item_id, claimant_id, status, created_by, created_at, seq)"
-            " VALUES (?,?,'active',?,?,?)",
-            (item_id, claimant_id, staff_id, at, seq),
+            "INSERT INTO bookings(item_id, claimant_id, status, created_by, created_at,"
+            " slot_id, counter_id, seq)"
+            " VALUES (?,?,'active',?,?,?,?,?)",
+            (
+                item_id,
+                claimant_id,
+                staff_id,
+                at,
+                slot["id"],
+                item["custody_counter_id"],
+                seq,
+            ),
         )
         booking_id = cur.lastrowid
         audit(
             conn,
             f"staff:{staff_id}",
             "booking_created",
-            f"item={item['public_code']} booking={booking_id} claimant={claimant_id}",
+            f"item={item['public_code']} booking={booking_id} claimant={claimant_id}"
+            f" slot={slot['id']} counter={item['custody_counter_id']}",
         )
         return {
             "booking_id": booking_id,
@@ -580,7 +627,76 @@ def create_booking(
             "status": "active",
             "created_at": at,
             "item_status": "held",
-            "note": "仅安排到场，不改变实物持有；失去资格时预约会自动取消。",
+            "counter": scheduling._counter_brief(conn, item["custody_counter_id"]),
+            "slot": scheduling.slot_brief(slot),
+            **capacity,
+            "note": (
+                "仅安排到场，不改变实物持有；已确认该时段所有未报到预约都能"
+                "分给不同的可用值班人。失去资格或时段结束会取消/到期，不会自动恢复。"
+            ),
+        }
+
+
+def assign_legacy_booking_slot(
+    conn: sqlite3.Connection,
+    item_id: str,
+    booking_id: int,
+    slot_ref: str,
+    actor: sqlite3.Row,
+) -> dict[str, Any]:
+    """Give a slot once to a legacy (slotless) active booking.
+
+    The original claimant is kept; the booking may also simply be cancelled
+    through the normal cancel endpoint.  After assignment, every normal
+    capacity/eligibility rule applies and the booking can be received.
+    """
+    from . import scheduling
+
+    with transaction(conn):
+        scheduling.sweep_expired_bookings(conn)
+        item = get_item(conn, item_id)
+        booking = conn.execute(
+            "SELECT * FROM bookings WHERE id = ? AND item_id = ?", (booking_id, item_id)
+        ).fetchone()
+        if booking is None:
+            raise api_error(404, "booking_not_found", "预约不存在")
+        assert_desk_can_handle_item(conn, item, actor)
+        if booking["status"] != "active":
+            raise api_error(
+                409, "booking_not_active", "该预约已结束", booking_status=booking["status"]
+            )
+        if booking["slot_id"] is not None:
+            raise api_error(
+                409, "slot_already_assigned",
+                "该预约已有接待时段；如需改时段请取消后重新预约",
+                booking_id=booking_id,
+            )
+        slot = scheduling.resolve_slot(conn, slot_ref, create=False)
+        scheduling.assert_slot_not_ended(slot)
+        capacity = scheduling.assert_booking_fits(
+            conn, slot, item["custody_counter_id"]
+        )
+        at = now_iso()
+        conn.execute(
+            "UPDATE bookings SET slot_id = ?, counter_id = ? WHERE id = ?",
+            (slot["id"], item["custody_counter_id"], booking_id),
+        )
+        audit(
+            conn,
+            f"staff:{actor['id']}",
+            "legacy_booking_slot_assigned",
+            f"item={item['public_code']} booking={booking_id} slot={slot['id']}"
+            f" counter={item['custody_counter_id']}",
+        )
+        return {
+            "booking_id": booking_id,
+            "item_id": item_id,
+            "claimant_id": booking["claimant_id"],
+            "status": "active",
+            "counter": scheduling._counter_brief(conn, item["custody_counter_id"]),
+            "slot": scheduling.slot_brief(slot),
+            **capacity,
+            "note": "仍为原认领者补约时段；补约后按正常规则报到与交付。",
         }
 
 
@@ -595,7 +711,7 @@ def cancel_booking(
         if booking is None:
             raise api_error(404, "booking_not_found", "预约不存在")
         if booking["status"] != "active":
-            raise api_error(409, "booking_not_active", "该预约已结束", status=booking["status"])
+            raise api_error(409, "booking_not_active", "该预约已结束", booking_status=booking["status"])
         at = now_iso()
         conn.execute(
             "UPDATE bookings SET status = 'cancelled', ended_at = ?,"
@@ -619,7 +735,9 @@ def cancel_booking(
 def deliver(
     conn: sqlite3.Connection, item_id: str, claimant_id: str, staff_id: str
 ) -> dict[str, Any]:
-    invalid: APIErrorPayload | None = None
+    from . import scheduling
+
+    fail: APIErrorPayload | None = None
     result: dict[str, Any] | None = None
     with transaction(conn):
         item = get_item(conn, item_id)
@@ -651,97 +769,148 @@ def deliver(
                 "当前有效预约属于另一名认领者，不能向其交付",
                 booked_claimant_id=booking["claimant_id"],
             )
+        if booking["slot_id"] is None:
+            raise api_error(
+                409, "slot_required",
+                "旧预约尚未补约接待时段，不能交付；请先补约时段并报到",
+            )
+        slot = conn.execute(
+            "SELECT * FROM slots WHERE id = ?", (booking["slot_id"],)
+        ).fetchone()
+        assert slot is not None
 
-        elig = eligibility(conn, item_id, claimant_id)
-        if not elig["eligible"]:
-            # Eligibility loss normally cancels the booking at the moment it
-            # happens; this is the mandatory re-check at the desk.  Commit the
-            # cancellation, then fail the delivery.
+        if slot["ends_at"] <= now_iso():
+            # The slot has ended and the appointment was not delivered in
+            # time.  Expire it (committing below by failing *after* the
+            # transaction), so it cannot be checked in or delivered later.
             at = now_iso()
             conn.execute(
-                "UPDATE bookings SET status = 'cancelled', ended_at = ?,"
-                " ended_reason = 'eligibility_lost' WHERE id = ?",
-                (at, booking["id"]),
+                "UPDATE bookings SET status = 'expired', ended_at = ?,"
+                " ended_reason = ? WHERE id = ?",
+                (at, scheduling.SLOT_ENDED, booking["id"]),
             )
             audit(
                 conn,
                 f"staff:{staff_id}",
-                "booking_cancelled",
-                f"booking={booking['id']} reason=eligibility_lost_at_delivery",
+                "booking_expired",
+                f"booking={booking['id']} reason=slot_ended_at_delivery",
             )
-            invalid = {
-                "code": "evidence_invalid",
-                "message": "交付时复核未通过：有效私有线索不足，不能交付",
-                "valid_private_clue_count": elig["valid_private_clue_count"],
-                "required_private_clues": MIN_PRIVATE_CLUES,
+            fail = {
+                "code": scheduling.SLOT_ENDED,
+                "message": "该预约的接待时段已结束且未交付，不能补办；请重新预约新的时段",
+                "booking_id": booking["id"],
+                "slot": scheduling.slot_brief(slot),
             }
         else:
-            private_rows = [a for a in elig["answers"] if a["clue_status"] == VALID_PRIVATE]
-            at = now_iso()
-            seq = next_seq(conn)
-            cur = conn.execute(
-                "INSERT INTO deliveries(item_id, claimant_id, booked_by, delivered_by,"
-                " delivered_at, private_clue_count, eligibility_note, seq)"
-                " VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    item_id,
-                    claimant_id,
-                    booking["created_by"],
-                    staff_id,
-                    at,
-                    len(private_rows),
-                    (
-                        f"交付时复核：{len(private_rows)} 条有效私有线索（"
-                        + "、".join(r["detail_code"] for r in private_rows)
-                        + f"），预约 #{booking['id']} 有效，实物仍在馆。"
-                    ),
-                    seq,
-                ),
-            )
-            delivery_id = cur.lastrowid
-
-            for row in private_rows:
-                conn.execute(
-                    "INSERT INTO delivery_evidence(delivery_id, detail_id, detail_code,"
-                    " detail_label, answer_at_delivery, answer_at_submission, submitted_text,"
-                    " counted_as_private, was_public_at_delivery, epoch_at_submission,"
-                    " submitted_seq, submitted_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        delivery_id,
-                        row["detail_id"],
-                        row["detail_code"],
-                        row["detail_label"],
-                        row["current_answer"],
-                        row["expected_at_submission"],
-                        row["text"],
-                        1,
-                        1 if row["is_public"] else 0,
-                        row["epoch_at_submission"],
-                        row["seq"],
-                        row["submitted_at"],
-                    ),
+            checkin = conn.execute(
+                "SELECT * FROM reception_checkins WHERE booking_id = ?",
+                (booking["id"],),
+            ).fetchone()
+            if checkin is None:
+                raise api_error(
+                    409, "not_checked_in",
+                    "交付前必须先由保管柜台登记实际接待人",
+                    booking_id=booking["id"],
                 )
 
-            conn.execute(
-                "UPDATE bookings SET status = 'fulfilled', ended_at = ? WHERE id = ?",
-                (at, booking["id"]),
-            )
-            conn.execute(
-                "UPDATE items SET status = 'delivered', updated_at = ? WHERE id = ?",
-                (at, item_id),
-            )
-            audit(
-                conn,
-                f"staff:{staff_id}",
-                "delivery_completed",
-                f"item={item['public_code']} delivery={delivery_id} claimant={claimant_id}"
-                f" booking={booking['id']}",
-            )
-            result = delivery_view(conn, item_id)
+            elig = eligibility(conn, item_id, claimant_id)
+            if not elig["eligible"]:
+                # Eligibility loss normally cancels the booking when it
+                # happens; this is the mandatory re-check at the desk.  The
+                # checked-in person's seat stays reserved until the slot ends.
+                at = now_iso()
+                conn.execute(
+                    "UPDATE bookings SET status = 'cancelled', ended_at = ?,"
+                    " ended_reason = 'eligibility_lost' WHERE id = ?",
+                    (at, booking["id"]),
+                )
+                audit(
+                    conn,
+                    f"staff:{staff_id}",
+                    "booking_cancelled",
+                    f"booking={booking['id']} reason=eligibility_lost_at_delivery",
+                )
+                fail = {
+                    "code": "evidence_invalid",
+                    "message": "交付时复核未通过：有效私有线索不足，不能交付",
+                    "valid_private_clue_count": elig["valid_private_clue_count"],
+                    "required_private_clues": MIN_PRIVATE_CLUES,
+                }
+            else:
+                private_rows = [
+                    a for a in elig["answers"] if a["clue_status"] == VALID_PRIVATE
+                ]
+                at = now_iso()
+                seq = next_seq(conn)
+                cur = conn.execute(
+                    "INSERT INTO deliveries(item_id, claimant_id, booked_by, delivered_by,"
+                    " delivered_at, private_clue_count, eligibility_note, seq,"
+                    " booking_id, slot_id, reception_staff_id, counter_id)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        item_id,
+                        claimant_id,
+                        booking["created_by"],
+                        staff_id,
+                        at,
+                        len(private_rows),
+                        (
+                            f"交付时复核：{len(private_rows)} 条有效私有线索（"
+                            + "、".join(r["detail_code"] for r in private_rows)
+                            + f"），预约 #{booking['id']} 有效，已在时段 "
+                            + f"{slot['id']} 报到，实物仍在馆。"
+                        ),
+                        seq,
+                        booking["id"],
+                        slot["id"],
+                        checkin["staff_id"],
+                        checkin["counter_id"],
+                    ),
+                )
+                delivery_id = cur.lastrowid
 
-    if invalid is not None:
-        raise HTTPException(status_code=409, detail=invalid)
+                for row in private_rows:
+                    conn.execute(
+                        "INSERT INTO delivery_evidence(delivery_id, detail_id, detail_code,"
+                        " detail_label, answer_at_delivery, answer_at_submission, submitted_text,"
+                        " counted_as_private, was_public_at_delivery, epoch_at_submission,"
+                        " submitted_seq, submitted_at)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            delivery_id,
+                            row["detail_id"],
+                            row["detail_code"],
+                            row["detail_label"],
+                            row["current_answer"],
+                            row["expected_at_submission"],
+                            row["text"],
+                            1,
+                            1 if row["is_public"] else 0,
+                            row["epoch_at_submission"],
+                            row["seq"],
+                            row["submitted_at"],
+                        ),
+                    )
+
+                conn.execute(
+                    "UPDATE bookings SET status = 'fulfilled', ended_at = ? WHERE id = ?",
+                    (at, booking["id"]),
+                )
+                conn.execute(
+                    "UPDATE items SET status = 'delivered', updated_at = ? WHERE id = ?",
+                    (at, item_id),
+                )
+                audit(
+                    conn,
+                    f"staff:{staff_id}",
+                    "delivery_completed",
+                    f"item={item['public_code']} delivery={delivery_id}"
+                    f" claimant={claimant_id} booking={booking['id']}",
+                )
+                result = delivery_view(conn, item_id)
+
+    if fail is not None:
+        raise HTTPException(status_code=409, detail=fail)
     assert result is not None
     return result
 
@@ -768,6 +937,19 @@ def public_item(conn: sqlite3.Connection, item: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _active_booking_now(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | None:
+    """Active booking that has not effectively expired with its slot."""
+    return conn.execute(
+        "SELECT b.*, c.display_name, s.ends_at AS slot_ends_at"
+        "  FROM bookings b JOIN claimants c ON c.id = b.claimant_id"
+        "  LEFT JOIN slots s ON s.id = b.slot_id"
+        " WHERE b.item_id = ? AND b.status = 'active'"
+        "   AND (s.ends_at IS NULL OR s.ends_at > ?)"
+        " ORDER BY b.id DESC LIMIT 1",
+        (item_id, now_iso()),
+    ).fetchone()
+
+
 def staff_item(conn: sqlite3.Connection, item: sqlite3.Row) -> dict[str, Any]:
     details = conn.execute(
         "SELECT * FROM details WHERE item_id = ? ORDER BY code", (item["id"],)
@@ -777,11 +959,7 @@ def staff_item(conn: sqlite3.Connection, item: sqlite3.Row) -> dict[str, Any]:
         " WHERE d.item_id = ? ORDER BY c.id",
         (item["id"],),
     ).fetchall()
-    booking = conn.execute(
-        "SELECT b.*, c.display_name FROM bookings b JOIN claimants c ON c.id = b.claimant_id"
-        " WHERE b.item_id = ? AND b.status = 'active'",
-        (item["id"],),
-    ).fetchone()
+    booking = _active_booking_now(conn, item["id"])
     delivery = conn.execute(
         "SELECT * FROM deliveries WHERE item_id = ?", (item["id"],)
     ).fetchone()
@@ -838,9 +1016,7 @@ def item_claimants(conn: sqlite3.Connection, item: sqlite3.Row) -> list[dict[str
         (item["id"],),
     ).fetchall()
     matrix = latest_answers_by_claimant(conn, item["id"])
-    booking = conn.execute(
-        "SELECT * FROM bookings WHERE item_id = ? AND status = 'active'", (item["id"],)
-    ).fetchone()
+    booking = _active_booking_now(conn, item["id"])
     delivery = conn.execute(
         "SELECT * FROM deliveries WHERE item_id = ?", (item["id"],)
     ).fetchone()
@@ -883,6 +1059,27 @@ def delivery_view(conn: sqlite3.Connection, item_id: str) -> dict[str, Any]:
     claimant = conn.execute(
         "SELECT display_name FROM claimants WHERE id = ?", (delivery["claimant_id"],)
     ).fetchone()
+
+    def _staff_name(staff_id: str) -> dict[str, Any] | None:
+        row = conn.execute(
+            "SELECT id, name FROM staff WHERE id = ?", (staff_id,)
+        ).fetchone()
+        return None if row is None else {"id": row["id"], "name": row["name"]}
+
+    def _counter_name(counter_id: str) -> dict[str, Any] | None:
+        row = conn.execute(
+            "SELECT id, code, name FROM counters WHERE id = ?", (counter_id,)
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def _delivery_slot(slot_id: str) -> dict[str, Any] | None:
+        row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
+        return None if row is None else {
+            "slot_id": row["id"],
+            "starts_at": row["starts_at"],
+            "ends_at": row["ends_at"],
+        }
+
     evidence = conn.execute(
         "SELECT e.*, d.correction_epoch AS current_epoch, d.answer AS current_answer,"
         " d.is_public AS currently_public"
@@ -927,6 +1124,15 @@ def delivery_view(conn: sqlite3.Connection, item_id: str) -> dict[str, Any]:
         "delivered_at": delivery["delivered_at"],
         "private_clue_count": delivery["private_clue_count"],
         "eligibility_note": delivery["eligibility_note"],
+        "slot": None
+        if delivery["slot_id"] is None
+        else _delivery_slot(delivery["slot_id"]),
+        "reception_staff": None
+        if delivery["reception_staff_id"] is None
+        else _staff_name(delivery["reception_staff_id"]),
+        "counter": None
+        if delivery["counter_id"] is None
+        else _counter_name(delivery["counter_id"]),
         "evidence": items,
         "has_later_invalidated_evidence": any_later_invalidated,
         "note": (

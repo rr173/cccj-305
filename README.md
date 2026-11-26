@@ -45,6 +45,45 @@ Python + FastAPI + SQLite 实现的失物招领后端。不含图片识别；所
 若甲柜开 A 时反而去扫 `(A, X)` 想签“本箱实到”，会因该标签已在 B 报到而整单被拒
 （`label_reported_in_other_box`）；正确做法是不扫它、登记缺件完成对上。
 
+## 接待排班与到场预约如何落地
+
+原有资格规则不变；在此基础上，到场预约带**接待人力担保**：认领人拿到的时段，
+一定能分给一名在本时段本柜台名单中的值班人，不会因为同一值班人挂在多个柜台
+的名单里而拿到一张没人能接待的预约。
+
+| 需求 | 实现 |
+| --- | --- |
+| 接待时段固定为 UTC 整点或半点开始的 30 分钟 | `slot_start` 接受带时区的 ISO 时间，必须落在 `:00` 或 `:30`；`slot_YYYYMMDDTHHMMZ` 亦可；已结束时段 409 `slot_ended` |
+| 管理员设置/整体替换某时段接待名单 | `PUT /api/staff/slots/{slot}/roster`（仅管理员），`entries: [{staff_id, counter_ids[]}]` 整体替换 |
+| 名单写明每名值班人能在哪些柜台接待 | `counter_ids` 每项接受柜台 id 或 code；同一人对同一柜台重复 422 |
+| 同一人同一时段只能接待一单 | 每时段以“人”为名额（一人挂多柜台仍只算一个名额）；`reception_checkins` 唯一索引 `(slot_id, staff_id)` 兜底 |
+| 排班不改变工作人员所属柜台与原有权限 | 名单独立于 `staff.counter_id`；不改权限、不改保管柜台 |
+| 保管柜台按现有资格选择到场人 | 预约仍由实物保管柜台发起，仍要求两条有效私有线索 |
+| 只有全部未报到预约都能分给不同可用值班人时才确认新预约 | 确认前对“现有未报到 + 新预约”做一一匹配；无解 409 `slot_capacity_unavailable` |
+| 不能为接新单取消旧单 | 失败路径只读匹配，不写任何取消；旧预约保持原状 |
+| 未报到的单不向认领人承诺具体值班人 | 认领者视图只给柜台、时段、状态、原因；不返回名单或人选 |
+| 人在时段内到了，保管柜台登记实际接待人 | `POST /api/staff/items/{id}/bookings/{bid}/check-in`，仅该保管柜台可办 |
+| 只有名单内、本时段未用过、且接待后不会让其他未报到预约无人可接才接受报到 | 依次校验 `not_on_counter_roster`、`reception_person_already_used`、`checkin_would_strand_other_bookings` |
+| 实际接待一经登记，名额保留到时段结束 | 提前交付、资格/调拨/取消后该人名额仍占用；唯一索引保证不能再用 |
+| 交付前必须报到 | 无报到 409 `not_checked_in`；仍按原规则复核资格与实物保管 |
+| 排班调整不抹掉报到记录，单独改名单不能让已报到有效预约无法交付 | 缩减名单保留全部已报到预约；清空名单不影响已报到单交付 |
+| 名单缩减：已报到不动，剩余人力保留尽可能多未报到预约 | 对未报到单做最大匹配；已报到人先占用名额 |
+| 同样多时按确认先后保留较早的单 | 匹配按 `seq, id` 升序（先确认先保留） |
+| 其余单显示因排班变更取消，恢复名单也不自动恢复 | `ended_reason = roster_changed`，单向 |
+| 取消即释放承诺；时段结束仍未交付不能再报到/交付，也不阻挡之后的预约 | 有效期结束的预约扫为 `expired / slot_ended`；仅释放该件的 `one_active_booking_per_item` |
+| 已登记的报到与交付历史保留 | `reception_checkins`、`deliveries` 只增不改，交付带 `slot_id`、`reception_staff_id` |
+| 工作人员查各柜台在一个时段的预约及办理结果 | `GET /api/staff/slots/{slot}/bookings?counter=`（含名单与各单状态/报到/交付） |
+| 认领者查自己的柜台、时段及取消/到期原因 | `GET /api/claimant/items/{code}/status` 的 `booking`（`counter`、`slot`、`ended_reason`） |
+| 不向认领者暴露他人预约、内部排班或私有线索 | 认领者接口只回自己的预约，不含名单/人选/他人 |
+| 升级保留旧记录；无时段旧预约可补约或取消 | `migrate()` 加列不删数据；`POST .../bookings/{bid}/slot` 补约（原认领人、仅保管柜台），或照常取消；未补时段不能报到/交付（`slot_required`） |
+
+### 关键点：共享值班人只算一个名额
+
+若值班员甲在本时段的名单里同时挂总台与东门台，而他只能接待一单，那么“甲的总台
+预约 + 甲的东门台预约”仍然是不可能同时兑现的——系统把它按**一个人**匹配，第二个
+预约会被 `slot_capacity_unavailable` 拒绝，且不会取消第一个。增加另一名值班人后
+两个预约才能成立。
+
 ## 原有资格规则如何落地
 
 | 需求 | 实现 |
@@ -151,6 +190,27 @@ curl localhost:8000/api/staff/items/<item_id>/location -H "$H"
 # 7) 预约/交付仍是原接口与原资格规则，但必须由当时 at_counter 保管该件的
 #    柜台工作人员办理：在途/缺件/隔离 -> 409 item_in_transit/item_missing/
 #    item_quarantined；其他柜台 -> 403 wrong_counter。
+
+# 8) 接待排班：先由管理员写某个时段的名单（整体替换），再预约该时段。
+#    时段为 UTC 整点/半点开始 30 分钟；同一值班人可挂多个柜台但仍只算一个名额。
+SLOT="$(date -u '+%Y-%m-%dT%H:00:00Z')"           # 或先把分钟对齐到 :00/:30
+curl -X PUT "localhost:8000/api/staff/slots/$SLOT/roster" -H "$H" -H "$J" -d '{
+  "entries": [{"staff_id":"<值班人id>","counter_ids":["MAIN","EAST"]}]
+}'
+curl -X POST localhost:8000/api/staff/items/<item_id>/bookings -H "$H" -H "$J" \
+  -d "{\"claimant_id\":\"<认领者id>\",\"slot_start\":\"$SLOT\"}"
+# 若该时段剩余人力不足以让所有未报到预约各分到一名不同值班人 -> 409
+# slot_capacity_unavailable，既有预约不会被取消。
+
+# 9) 认领者在时段内到场，保管柜台登记实际接待人；随后才能交付。
+curl -X POST localhost:8000/api/staff/items/<item_id>/bookings/<bid>/check-in \
+  -H "$H" -H "$J" -d '{"reception_staff_id":"<值班人id>"}'
+curl -X POST localhost:8000/api/staff/items/<item_id>/deliveries \
+  -H "$H" -H "$J" -d '{"claimant_id":"<认领者id>"}'
+
+# 10) 工作人员按柜台查该时段的预约与办理结果；认领者只看到自己的预约。
+curl "localhost:8000/api/staff/slots/$SLOT/bookings?counter=EAST" -H "$H"
+curl "localhost:8000/api/claimant/items/<public_code>/status" -H "<认领者令牌>"
 ```
 
 可复跑的端到端演示（临时库、全虚构数据，含错箱两种开箱顺序的故事）：
@@ -196,31 +256,37 @@ python3 demo/transfer_demo.py
 | POST | `/api/staff/items/{id}/details/{detail_id}/publish` | 公开细节（不可撤销） |
 | POST | `/api/staff/items/{id}/details/{detail_id}/correct` | 更正答案，作废旧回答 |
 | GET | `/api/staff/items/{id}/claimants` | 内部逐条比对矩阵 |
-| POST | `/api/staff/items/{id}/bookings` | 选择一名达标认领者安排到场 |
-| GET | `/api/staff/items/{id}/bookings` | 预约历史 |
+| POST | `/api/staff/items/{id}/bookings` | 选择一名达标认领者并指定时段安排到场（需时段与接待人力） |
+| GET | `/api/staff/items/{id}/bookings` | 预约历史（含柜台、时段、报到、交付） |
 | POST | `/api/staff/items/{id}/bookings/{bid}/cancel` | 工作人员取消预约 |
-| POST | `/api/staff/items/{id}/deliveries` | 交付（复核后写快照） |
+| POST | `/api/staff/items/{id}/bookings/{bid}/check-in` | 保管柜台登记实际接待人（报到） |
+| POST | `/api/staff/items/{id}/bookings/{bid}/slot` | 为无时段旧预约补约时段（或改走取消） |
+| GET | `/api/staff/slots`、`/api/staff/slots/{slot}` | 时段列表 / 单时段名单与预约视图 |
+| PUT | `/api/staff/slots/{slot}/roster` | 管理员整体替换该时段接待名单 |
+| GET | `/api/staff/slots/{slot}/bookings?counter=` | 各柜台在该时段的预约及办理结果 |
+| POST | `/api/staff/items/{id}/deliveries` | 交付（须先报到；复核后写快照） |
 | GET | `/api/staff/items/{id}/delivery` | 历史交付与后来失效标注 |
 
 ## 演示
 
 ```bash
-python3 demo/demo.py            # 资格/预约/更正/交付历史
-python3 demo/transfer_demo.py   # 柜台/发箱/错箱隔离与两箱对上/找到柜台交付
+python3 demo/demo.py             # 资格/预约/更正/交付历史
+python3 demo/transfer_demo.py    # 柜台/发箱/错箱隔离与两箱对上/找到柜台交付
+python3 demo/reception_demo.py   # 共用值班人、时段名单、报到与名单缩减
 ```
 
-两个脚本都使用临时 SQLite 文件与“认领者甲/乙（化名）”等虚构数据。
+三个脚本都使用临时 SQLite 文件与“认领者甲/乙/丙（化名）”等虚构数据。
 `demo/demo.py` 依次演示：
 
 1. 工作人员登记失物与三条私有细节；
 2. 甲、乙各自在**公开前**提交两条正确答案，均达标；
 3. 公开“贴纸形状”，公开前的正确回答仍有效；
-4. 工作人员选择甲安排到场（实物仍由馆方持有）；
+4. 工作人员选择甲并指定接待时段安排到场（实物仍由馆方持有）；
 5. 更正“杯底刻字”，甲此前的回答失效、预约自动取消；
 6. 向甲交付被拒；
 7. 甲原样重送旧答案，仍无效；
 8. 乙改答更正后的答案后重新达标；
-9. 工作人员重新选择乙并完成交付；
+9. 工作人员重新选择乙、指定时段；乙到场后由保管柜台登记实际接待人并交付；
 10. 交付后再更正“贴纸形状”，历史交付与交付对象保持不变，仅标注该依据后来失效。
 
 ## 测试
@@ -229,8 +295,25 @@ python3 demo/transfer_demo.py   # 柜台/发箱/错箱隔离与两箱对上/找�
 python3 -m pytest
 ```
 
-共 49 项测试。原有 23 项覆盖：隐私边界、空白/大小写匹配、公开时点、重送、
+共 68 项测试。原有 23 项覆盖：隐私边界、空白/大小写匹配、公开时点、重送、
 更正永久失效、预约互斥与自动取消、交付复核、交付后历史冻结。
+
+`tests/test_reception_slots.py` 的 19 项额外覆盖接待排班：
+
+- 时段必须是 UTC 整点/半点、已结束时段拒绝预约；
+- 名单整体替换、版本、重复项/未知人/未知柜台校验、仅管理员可设置、不改所属柜台；
+- **共享值班人只算一个名额**：同一人挂两个柜台仍不能让两单同时成立，且不取消旧单；
+- 新预约绝不取消旧单（容量不足 409，旧单原样保留）；
+- 报到需名单内、本柜台、本时段未用过，且不能让其他未报到预约无人可接；
+- 提前交付或取消后，报到人的名额仍占用到时段结束；
+- 名单缩减保留已报到与尽可能多、且较早确认的未报到单，其余 `roster_changed`
+  取消且恢复名单不复活；清空名单只剩已报到单且仍可交付；
+- 时段结束预约 `expired / slot_ended`，不能补报到/交付，也不阻挡新时段；
+- 工作人员按柜台查一个时段的预约与报到/交付结果；
+- 认领者只见自己的柜台、时段与原因，看不到名单/人选/他人预约；
+- 调拨、资格变化与报到/交付不留下矛盾记录。
+- **旧库升级**：加列不删旧预约/旧交付；无时段旧预约可补约（原认领人、仅保管柜台）
+  或取消，未补时段不能报到/交付。
 
 `tests/test_counters_transfers.py` 的 26 项额外覆盖：
 
@@ -258,16 +341,18 @@ app/
   db.py               Schema、旧库迁移（总台兜底）、事务、审计、序号发生器
   security.py         Bearer 令牌与身份依赖
   schemas.py          请求模型（拒绝未知字段）
-  services.py         领域规则（有效性、资格、预约、交付快照、柜台保管门禁）
+  services.py         领域规则（有效性、资格、预约、交付快照、柜台保管门禁、旧预约补约）
+  scheduling.py       接待时段、名单、共享人力匹配、报到、名单缩减与到期
   transfers.py        柜台、发箱、签收、错箱双向对上、位置视图
   routers/
     public.py         公网与认领者接口
-    staff.py          工作人员/柜台成员/失物/资格/预约/交付
+    staff.py          工作人员/柜台成员/失物/资格/预约/报到/时段名单/交付
     operations.py     柜台、发箱签收、箱子查询、单件位置
 demo/
   demo.py             两名认领者的端到端演示
   transfer_demo.py    跨柜台调拨与错箱对上演示
-tests/                规则测试（49 项，可复跑）
+  reception_demo.py   共用值班人、时段名单、报到与名单缩减演示
+tests/                规则测试（68 项，可复跑）
 ```
 
 ## 设计说明与边界

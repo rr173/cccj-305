@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -101,8 +102,26 @@ def main() -> None:
                 "/api/claimant/answers", headers=ch,
                 json={"public_code": cup["public_code"], "detail_code": code, "text": text},
             )
+        now = datetime.now(timezone.utc)
+        slot = now.replace(
+            minute=(now.minute // 30) * 30, second=0, microsecond=0
+        ).isoformat()
+        main_duty = post("/api/staff/operators", ah,
+                         {"name": "总台值班员（化名）", "counter_id": "MAIN"})
+        east_duty = post("/api/staff/operators", ah,
+                         {"name": "东门值班员（化名）", "counter_id": "EAST"})
+        west_duty = post("/api/staff/operators", ah,
+                         {"name": "西门值班员（化名）", "counter_id": "WEST"})
+        client.put(
+            f"/api/staff/slots/{slot}/roster", headers=ah,
+            json={"entries": [
+                {"staff_id": main_duty["staff_id"], "counter_ids": ["MAIN"]},
+                {"staff_id": east_duty["staff_id"], "counter_ids": ["EAST"]},
+                {"staff_id": west_duty["staff_id"], "counter_ids": ["WEST"]},
+            ]},
+        )
         post(f"/api/staff/items/{cup['id']}/bookings", ah,
-             {"claimant_id": claimant["claimant_id"]})
+             {"claimant_id": claimant["claimant_id"], "slot_start": slot})
 
         # 3. Dispatch A -> EAST with cup, B -> WEST with umbrella -----------
         box_a = post("/api/staff/boxes", ah, {
@@ -151,11 +170,17 @@ def main() -> None:
 
         # 6. Claim is handled by the finder counter (WEST) -------------------
         booking = post(f"/api/staff/items/{cup['id']}/bookings", wh,
-                       {"claimant_id": claimant["claimant_id"]})
+                       {"claimant_id": claimant["claimant_id"], "slot_start": slot})
+        checkin = post(
+            f"/api/staff/items/{cup['id']}/bookings/{booking['booking_id']}/check-in",
+            wh, {"reception_staff_id": west_duty["staff_id"]},
+        )
         delivery = post(f"/api/staff/items/{cup['id']}/deliveries", wh,
                         {"claimant_id": claimant["claimant_id"]})
         show("5. 资格规则不变；由实际找到并保管杯子的西门台办理交付", {
             "booking_id": booking["booking_id"],
+            "reception_staff": checkin["reception_staff"]["name"],
+            "slot": delivery["slot"],
             "delivery_id": delivery["delivery_id"],
             "private_clue_count": delivery["private_clue_count"],
         })

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .conftest import Staff
+from .conftest import Staff, current_slot_start, setUpReception
 
 DETAILS = [
     {"code": "1", "label": "杯底刻字", "answer": "L.K. 2024"},
@@ -23,21 +23,23 @@ def detail_id(item, code):
     return next(d["id"] for d in item["details"] if d["code"] == code)
 
 
-def delivered(staff: Staff):
+def delivered(staff: Staff, duty: Staff, slot: str):
     item = staff.create_item(DETAILS)
     a_id, a_headers = staff.create_claimant("认领者甲")
     answer(staff, a_headers, item, "1", "L.K. 2024")
     answer(staff, a_headers, item, "2", "星星")
-    staff.post(f"/api/staff/items/{item['id']}/bookings", json={"claimant_id": a_id})
-    r = staff.post(
-        f"/api/staff/items/{item['id']}/deliveries", json={"claimant_id": a_id}
-    )
+    booking = staff.book(item["id"], a_id, slot).json()
+    assert staff.checkin(item["id"], booking["booking_id"], duty.staff_id).status_code == 201
+    r = staff.deliver(item["id"], a_id)
     assert r.status_code == 201, r.text
-    return item, a_id, a_headers, r.json()
+    return item, a_id, a_headers, r.json(), booking
 
 
 def test_post_delivery_correction_keeps_history(staff: Staff):
-    item, a_id, a_headers, delivery = delivered(staff)
+    duty = staff.create_operator("MAIN", "值班")
+    slot = current_slot_start()
+    setUpReception(staff, slot, [(duty, "MAIN")])
+    item, a_id, a_headers, delivery, booking = delivered(staff, duty, slot)
     before = {e["detail_code"]: e for e in delivery["evidence"]}
 
     r = staff.post(
@@ -54,6 +56,9 @@ def test_post_delivery_correction_keeps_history(staff: Staff):
     assert after["delivered_at"] == delivery["delivered_at"]
     assert after["private_clue_count"] == 2
     assert after["has_later_invalidated_evidence"] is True
+    # Reception facts are preserved with the delivery.
+    assert after["reception_staff"]["id"] == duty.staff_id
+    assert after["slot"]["slot_id"] == booking["slot"]["slot_id"]
 
     rows = {e["detail_code"]: e for e in after["evidence"]}
     assert rows["1"]["answer_at_delivery"] == "L.K. 2024"
@@ -65,15 +70,21 @@ def test_post_delivery_correction_keeps_history(staff: Staff):
     assert rows["1"]["answer_at_delivery"] == before["1"]["answer_at_delivery"]
     assert rows["2"]["answer_at_delivery"] == before["2"]["answer_at_delivery"]
 
-    # Claimant sees the same frozen delivery record.
+    # Claimant sees the same frozen delivery record and the booking outcome.
     own = staff.client.get(
         f"/api/claimant/items/{item['public_code']}/status", headers=a_headers
     ).json()
     assert own["delivered_to_you"] is True
+    assert own["booking"]["status"] == "fulfilled"
+    assert own["booking"]["counter"]["code"] == "MAIN"
+    assert own["booking"]["slot"]["slot_id"] == booking["slot"]["slot_id"]
 
 
 def test_second_delivery_attempt_after_correction_rejected(staff: Staff):
-    item, a_id, _, delivery = delivered(staff)
+    duty = staff.create_operator("MAIN", "值班")
+    slot = current_slot_start()
+    setUpReception(staff, slot, [(duty, "MAIN")])
+    item, a_id, _, delivery, _ = delivered(staff, duty, slot)
     staff.post(
         f"/api/staff/items/{item['id']}/details/{detail_id(item, '1')}/correct",
         json={"answer": "L.K. 2025"},
@@ -82,9 +93,7 @@ def test_second_delivery_attempt_after_correction_rejected(staff: Staff):
         f"/api/staff/items/{item['id']}/details/{detail_id(item, '2')}/correct",
         json={"answer": "六角星"},
     )
-    r = staff.post(
-        f"/api/staff/items/{item['id']}/deliveries", json={"claimant_id": a_id}
-    )
+    r = staff.deliver(item["id"], a_id)
     assert r.status_code == 409
     assert r.json()["detail"]["code"] == "already_delivered"
     # Still exactly one delivery, unchanged.

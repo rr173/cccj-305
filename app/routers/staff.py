@@ -11,22 +11,27 @@ import secrets
 import sqlite3
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Query
+from typing import Annotated
 
 from ..schemas import (
     BookingCreate,
+    CheckInCreate,
     ClaimantCreate,
     CorrectionIn,
     DeliveryCreate,
     DetailAdd,
     ItemCreate,
+    LegacySlotAssign,
     OperatorCreate,
+    RosterSet,
     StaffCounterUpdate,
     StaffCreate,
 )
 from ..security import current_staff, get_conn, hash_token, new_token
 from ..db import MAIN_COUNTER_ID, audit, now_iso, next_seq, transaction
 from .. import services
+from .. import scheduling
 from .. import transfers
 
 router = APIRouter(prefix="/api/staff", tags=["staff"])
@@ -266,23 +271,84 @@ def item_claimants(item_id: str, conn: Conn, staff: Staff) -> dict:
 def create_booking(
     item_id: str, payload: BookingCreate, conn: Conn, staff: Staff
 ) -> dict:
-    return services.create_booking(conn, item_id, payload.claimant_id, staff["id"])
+    return services.create_booking(
+        conn, item_id, payload.claimant_id, staff["id"], payload.slot_start
+    )
 
 
 @router.get("/items/{item_id}/bookings")
 def list_bookings(item_id: str, conn: Conn, staff: Staff) -> dict:
     services.get_item(conn, item_id)
     rows = conn.execute(
-        "SELECT b.*, c.display_name FROM bookings b JOIN claimants c ON c.id = b.claimant_id"
+        "SELECT b.*, s.starts_at AS slot_starts_at, s.ends_at AS slot_ends_at"
+        "  FROM bookings b LEFT JOIN slots s ON s.id = b.slot_id"
         " WHERE b.item_id = ? ORDER BY b.id",
         (item_id,),
     ).fetchall()
-    return {"bookings": [dict(r) for r in rows]}
+    return {
+        "bookings": [
+            scheduling.staff_booking_view(conn, row) for row in rows
+        ]
+    }
 
 
 @router.post("/items/{item_id}/bookings/{booking_id}/cancel")
 def cancel_booking(item_id: str, booking_id: int, conn: Conn, staff: Staff) -> dict:
     return services.cancel_booking(conn, item_id, booking_id, staff["id"])
+
+
+@router.post("/items/{item_id}/bookings/{booking_id}/check-in", status_code=201)
+def check_in_booking(
+    item_id: str, booking_id: int, payload: CheckInCreate, conn: Conn, staff: Staff
+) -> dict:
+    return scheduling.check_in(
+        conn, item_id, booking_id, payload.reception_staff_id, staff
+    )
+
+
+@router.post("/items/{item_id}/bookings/{booking_id}/slot")
+def assign_legacy_slot(
+    item_id: str, booking_id: int, payload: LegacySlotAssign, conn: Conn, staff: Staff
+) -> dict:
+    """Give a slot once to a legacy (slotless) active booking, or cancel it.
+
+    Only the counter holding the item may do this, and only for the original
+    claimant.  A slotless booking cannot be checked in or delivered.
+    """
+    return services.assign_legacy_booking_slot(
+        conn, item_id, booking_id, payload.slot_start, staff
+    )
+
+
+@router.get("/slots")
+def list_slots(conn: Conn, staff: Staff) -> dict:
+    rows = conn.execute("SELECT * FROM slots ORDER BY starts_at").fetchall()
+    return {"slots": [scheduling.slot_brief(r) for r in rows]}
+
+
+@router.get("/slots/{slot_ref}")
+def get_slot(slot_ref: str, conn: Conn, staff: Staff) -> dict:
+    slot = scheduling.resolve_slot(conn, slot_ref, create=False)
+    return {
+        "slot": scheduling.slot_brief(slot),
+        "roster": scheduling.roster_view(conn, slot),
+        "bookings": scheduling.slot_bookings_view(conn, slot_ref),
+    }
+
+
+@router.put("/slots/{slot_ref}/roster")
+def set_roster(slot_ref: str, payload: RosterSet, conn: Conn, staff: Staff) -> dict:
+    return scheduling.set_roster(conn, staff, slot_ref, payload.entries)
+
+
+@router.get("/slots/{slot_ref}/bookings")
+def slot_bookings(
+    slot_ref: str,
+    conn: Conn,
+    staff: Staff,
+    counter: Annotated[str | None, Query(max_length=64)] = None,
+) -> dict:
+    return scheduling.slot_bookings_view(conn, slot_ref, counter)
 
 
 @router.post("/items/{item_id}/deliveries", status_code=201)

@@ -166,6 +166,34 @@ class AnswerSubmit(InputModel):
 
 class BookingCreate(InputModel):
     claimant_id: str = Field(min_length=1, max_length=64)
+    # Canonical slot id (``slot_YYYYMMDDTHHMMZ``) or an ISO instant on a UTC
+    # full/half hour.  Must not have ended yet.
+    slot_start: str = Field(
+        min_length=1,
+        max_length=64,
+        description="接待时段：UTC 整点或半点开始的 30 分钟；接受时段 id 或 ISO 时间",
+    )
+
+
+class RosterEntryIn(InputModel):
+    staff_id: str = Field(min_length=1, max_length=64)
+    # Counter ids or codes where this person may receive during the slot.
+    counter_ids: list[str] = Field(min_length=1)
+
+
+class RosterSet(InputModel):
+    # Replaces the slot roster as a whole; an empty list clears the roster.
+    entries: list[RosterEntryIn] = Field(default_factory=list, max_length=200)
+
+
+class CheckInCreate(InputModel):
+    # The rostered duty person who actually received this booking.
+    reception_staff_id: str = Field(min_length=1, max_length=64)
+
+
+class LegacySlotAssign(InputModel):
+    # Assign a slot once to an existing slotless (legacy) active booking.
+    slot_start: str = Field(min_length=1, max_length=64)
 
 
 class DeliveryCreate(InputModel):

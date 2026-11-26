@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from .conftest import Staff
+from .conftest import Staff, current_slot_start, setUpReception
 
 DETAILS = [
     {"code": "1", "label": "杯底刻字", "answer": "L.K. 2024"},
@@ -256,12 +256,12 @@ def test_legacy_database_migrates_everyone_to_main_desk(tmp_path):
 
 def test_dispatch_happy_path_cancels_booking_and_enters_transit(staff: Staff):
     east = make_counter(staff, "EAST", "东门台")
+    duty = staff.create_operator("MAIN", "总台值班")
+    setUpReception(staff, current_slot_start(), [(duty, "MAIN")])
     item = create_simple_item(staff)
     claimant_id, headers = staff.create_claimant("认领者甲")
     make_eligible(staff.client, headers, item["public_code"])
-    r = staff.post(
-        f"/api/staff/items/{item['id']}/bookings", json={"claimant_id": claimant_id}
-    )
+    r = staff.book(item["id"], claimant_id, current_slot_start())
     assert r.status_code == 201
     booking_id = r.json()["booking_id"]
 
@@ -330,6 +330,8 @@ def test_dispatch_manifest_must_be_nonempty_and_unique(staff: Staff):
 def test_dispatch_is_atomic_when_one_item_cannot_go(staff: Staff):
     make_counter(staff, "EAST", "东门台")
     east_staff = counter_staff(staff, "EAST", "东员")
+    duty = staff.create_operator("MAIN", "总台值班")
+    setUpReception(staff, current_slot_start(), [(duty, "MAIN")])
 
     good = create_simple_item(staff, "总台可发的杯")
     bad = east_staff.create_item([], title="东门的伞")  # not held by MAIN
@@ -337,9 +339,7 @@ def test_dispatch_is_atomic_when_one_item_cannot_go(staff: Staff):
     # Give the good item an active booking; it must survive the failed batch.
     cid, headers = staff.create_claimant("认领者甲")
     make_eligible(staff.client, headers, good["public_code"])
-    r = staff.post(
-        f"/api/staff/items/{good['id']}/bookings", json={"claimant_id": cid}
-    )
+    r = staff.book(good["id"], cid, current_slot_start())
     assert r.status_code == 201
 
     r = dispatch(staff, "BOX-BAD", "EAST", [good["id"], bad["id"]])
@@ -405,19 +405,19 @@ def test_item_cannot_be_put_in_two_boxes(staff: Staff):
 
 def test_in_transit_blocks_booking_and_delivery(staff: Staff):
     make_counter(staff, "EAST", "东门台")
+    duty = staff.create_operator("MAIN", "总台值班")
+    setUpReception(staff, current_slot_start(), [(duty, "MAIN")])
     item = create_simple_item(staff)
     cid, headers = staff.create_claimant("认领者甲")
     make_eligible(staff.client, headers, item["public_code"])
-    staff.post(f"/api/staff/items/{item['id']}/bookings", json={"claimant_id": cid})
+    assert staff.book(item["id"], cid, current_slot_start()).status_code == 201
     dispatch(staff, "B", "EAST", [item["id"]])
 
-    r = staff.post(f"/api/staff/items/{item['id']}/bookings", json={"claimant_id": cid})
+    r = staff.book(item["id"], cid, current_slot_start())
     assert r.status_code == 409
     assert r.json()["detail"]["code"] == "item_in_transit"
 
-    r = staff.post(
-        f"/api/staff/items/{item['id']}/deliveries", json={"claimant_id": cid}
-    )
+    r = staff.deliver(item["id"], cid)
     assert r.status_code == 409
     assert r.json()["detail"]["code"] == "item_in_transit"
 
@@ -493,7 +493,8 @@ def test_partial_scan_marks_arrivals_and_missing(staff: Staff):
     # Arrived item can be booked at EAST; missing item cannot.
     cid, _ = staff.create_claimant("认领者")
     r = east_staff.post(
-        f"/api/staff/items/{i2['id']}/bookings", json={"claimant_id": cid}
+        f"/api/staff/items/{i2['id']}/bookings",
+        json={"claimant_id": cid, "slot_start": current_slot_start()},
     )
     assert r.status_code == 409
     assert r.json()["detail"]["code"] == "item_missing"
@@ -655,7 +656,8 @@ def test_wrong_box_found_first_then_original_signs_missing(staff: Staff):
     # A not receipted yet: EAST cannot book X.
     cid, _ = staff.create_claimant("认领者甲")
     r = east_staff.post(
-        f"/api/staff/items/{x['id']}/bookings", json={"claimant_id": cid}
+        f"/api/staff/items/{x['id']}/bookings",
+        json={"claimant_id": cid, "slot_start": current_slot_start()},
     )
     assert r.status_code == 409
     assert r.json()["detail"]["code"] == "item_quarantined"
@@ -722,15 +724,32 @@ def test_finder_counter_completes_booking_and_delivery(staff: Staff):
     # The cancelled pre-transfer booking does not come back.
     assert active_booking(staff, x["id"]) == []
 
-    # EAST (original destination) has no authority; WEST (finder) can serve.
+    # WEST (finder) can serve; it needs a reception slot/roster of its own.
+    slot = current_slot_start()
+    west_duty = staff.create_operator("WEST", "西员二")
+    west_duty.staff_id = west_duty.staff_id
+    r = staff.set_roster(
+        slot, [{"staff_id": west_duty.staff_id, "counter_ids": ["WEST"]}]
+    )
+    assert r.status_code == 200, r.text
+
+    # EAST (original destination) has no authority.
     r = east_staff.post(
-        f"/api/staff/items/{x['id']}/bookings", json={"claimant_id": claimant_id}
+        f"/api/staff/items/{x['id']}/bookings",
+        json={"claimant_id": claimant_id, "slot_start": slot},
     )
     assert r.status_code == 403
     assert r.json()["detail"]["code"] == "wrong_counter"
 
     r = west_staff.post(
-        f"/api/staff/items/{x['id']}/bookings", json={"claimant_id": claimant_id}
+        f"/api/staff/items/{x['id']}/bookings",
+        json={"claimant_id": claimant_id, "slot_start": slot},
+    )
+    assert r.status_code == 201, r.text
+    booking_id = r.json()["booking_id"]
+    r = west_staff.post(
+        f"/api/staff/items/{x['id']}/bookings/{booking_id}/check-in",
+        json={"reception_staff_id": west_duty.staff_id},
     )
     assert r.status_code == 201, r.text
     r = west_staff.post(
@@ -757,9 +776,9 @@ def test_public_and_claimant_views_hide_internal_counting(staff: Staff):
 
     claimant_id, ch = staff.create_claimant("认领者隐私")
     make_eligible(staff.client, ch, x["public_code"])
-    r = staff.post(
-        f"/api/staff/items/{x['id']}/bookings", json={"claimant_id": claimant_id}
-    )
+    duty = staff.create_operator("MAIN", "总台值班")
+    setUpReception(staff, current_slot_start(), [(duty, "MAIN")])
+    r = staff.book(x["id"], claimant_id, current_slot_start())
     assert r.status_code == 201, r.text
 
     dispatch(staff, "SECRET-A", "EAST", [x["id"]])
@@ -846,9 +865,9 @@ def test_clue_correction_during_transfer_and_claim_at_finder(staff: Staff):
 
     claimant_id, ch = staff.create_claimant("认领者甲")
     make_eligible(staff.client, ch, x["public_code"])
-    r = staff.post(
-        f"/api/staff/items/{x['id']}/bookings", json={"claimant_id": claimant_id}
-    )
+    duty = staff.create_operator("MAIN", "总台值班")
+    setUpReception(staff, current_slot_start(), [(duty, "MAIN")])
+    r = staff.book(x["id"], claimant_id, current_slot_start())
     assert r.status_code == 201
 
     dispatch(staff, "A", "EAST", [x["id"]])
@@ -876,10 +895,21 @@ def test_clue_correction_during_transfer_and_claim_at_finder(staff: Staff):
     ).json()
     assert elig["eligible_for_delivery"] is True
 
+    slot = current_slot_start()
+    west_duty = staff.create_operator("WEST", "西员二")
+    assert staff.set_roster(
+        slot, [{"staff_id": west_duty.staff_id, "counter_ids": ["WEST"]}]
+    ).status_code == 200
     r = west_staff.post(
-        f"/api/staff/items/{x['id']}/bookings", json={"claimant_id": claimant_id}
+        f"/api/staff/items/{x['id']}/bookings",
+        json={"claimant_id": claimant_id, "slot_start": slot},
     )
     assert r.status_code == 201, r.text
+    booking_id = r.json()["booking_id"]
+    assert west_staff.post(
+        f"/api/staff/items/{x['id']}/bookings/{booking_id}/check-in",
+        json={"reception_staff_id": west_duty.staff_id},
+    ).status_code == 201
     r = west_staff.post(
         f"/api/staff/items/{x['id']}/deliveries", json={"claimant_id": claimant_id}
     )

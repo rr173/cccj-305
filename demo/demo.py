@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -108,6 +109,26 @@ def main() -> None:
         a_id, a_h = make_claimant("认领者甲（化名）")
         b_id, b_h = make_claimant("认领者乙（化名）")
 
+        # A reception slot on the UTC half-hour grid, with a duty person who
+        # may receive at 总台 for this slot.  Rostering is independent of the
+        # person's home counter and never affects the eligibility rules.
+        slot_start = datetime.now(timezone.utc).replace(
+            minute=(datetime.now(timezone.utc).minute // 30) * 30,
+            second=0,
+            microsecond=0,
+        )
+        slot = slot_start.isoformat()
+        duty = client.post(
+            "/api/staff/operators",
+            json={"name": "总台值班员（演示）", "counter_id": "MAIN"},
+            headers=sh,
+        ).json()
+        client.put(
+            f"/api/staff/slots/{slot}/roster",
+            json={"entries": [{"staff_id": duty["staff_id"], "counter_ids": ["MAIN"]}]},
+            headers=sh,
+        )
+
         # -- 2. Both claimants know answers BEFORE publication --------------
         for headers in (a_h, b_h):
             claimant_answer(headers, code, "1", "L.K. 2024")
@@ -143,7 +164,7 @@ def main() -> None:
         # -- 4. Staff books claimant A -------------------------------------
         booking_a = client.post(
             f"/api/staff/items/{item['id']}/bookings",
-            json={"claimant_id": a_id},
+            json={"claimant_id": a_id, "slot_start": slot},
             headers=sh,
         ).json()
         show(
@@ -210,10 +231,26 @@ def main() -> None:
         # -- 9. Staff reselects B ------------------------------------------
         booking_b = client.post(
             f"/api/staff/items/{item['id']}/bookings",
-            json={"claimant_id": b_id},
+            json={"claimant_id": b_id, "slot_start": slot},
             headers=sh,
         ).json()
         show("9. 工作人员重新选择乙安排到场", booking_b)
+
+        # The holding counter registers the actual reception person at arrival;
+        # delivery is impossible before check-in.
+        checkin = client.post(
+            f"/api/staff/items/{item['id']}/bookings/{booking_b['booking_id']}/check-in",
+            json={"reception_staff_id": duty["staff_id"]},
+            headers=sh,
+        ).json()
+        show(
+            "9b. 乙到场，保管柜台登记实际接待人（该值班人本时段名额被占住）",
+            {
+                "reception_staff": checkin["reception_staff"]["name"],
+                "slot": checkin["slot"],
+                "counter": checkin["counter"],
+            },
+        )
 
         delivery = client.post(
             f"/api/staff/items/{item['id']}/deliveries",
