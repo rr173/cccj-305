@@ -11,12 +11,21 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .db import connect, db_path_from_env, init_db
+from .routers.operations import router as operations_router
 from .routers.public import claimant_router, public_router
 from .routers.staff import router as staff_router
 
 
 def create_app(db_path: str | Path | None = None) -> FastAPI:
     resolved = Path(db_path) if db_path is not None else db_path_from_env()
+
+    # Initialize once at creation as well as in the lifespan, so clients that
+    # do not run lifespan startup still get a migrated schema.  Idempotent.
+    bootstrap_conn = connect(resolved)
+    try:
+        init_db(bootstrap_conn)
+    finally:
+        bootstrap_conn.close()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -40,9 +49,16 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     @app.exception_handler(sqlite3.IntegrityError)
     async def integrity_error(request: Request, exc: sqlite3.IntegrityError):
+        message = str(exc)
         code = "conflict"
-        if "one_active_booking_per_item" in str(exc):
+        if "one_active_booking_per_item" in message:
             code = "item_already_booked"
+        elif "one_accepted_scan_per_label" in message:
+            code = "label_already_scanned"
+        elif "one_open_box_line_per_item" in message:
+            code = "item_already_in_open_box"
+        elif "counter_code_taken" in message or "counters.code" in message:
+            code = "counter_code_taken"
         return JSONResponse(
             status_code=409,
             content={"detail": {"code": code, "message": "数据冲突，操作未生效"}},
@@ -62,6 +78,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     app.include_router(public_router)
     app.include_router(claimant_router)
     app.include_router(staff_router)
+    app.include_router(operations_router)
     return app
 
 

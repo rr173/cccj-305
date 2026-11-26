@@ -20,11 +20,14 @@ from ..schemas import (
     DeliveryCreate,
     DetailAdd,
     ItemCreate,
+    OperatorCreate,
+    StaffCounterUpdate,
     StaffCreate,
 )
 from ..security import current_staff, get_conn, hash_token, new_token
-from ..db import audit, now_iso, next_seq, transaction
+from ..db import MAIN_COUNTER_ID, audit, now_iso, next_seq, transaction
 from .. import services
+from .. import transfers
 
 router = APIRouter(prefix="/api/staff", tags=["staff"])
 
@@ -47,29 +50,86 @@ def bootstrap_staff(
         staff_id = services.new_id()
         token = new_token()
         conn.execute(
-            "INSERT INTO staff(id, name, token_hash, is_admin, created_at)"
-            " VALUES (?,?,?,1,?)",
-            (staff_id, payload.name, hash_token(token), now_iso()),
+            "INSERT INTO staff(id, name, token_hash, is_admin, counter_id, created_at)"
+            " VALUES (?,?,?,1,?,?)",
+            (staff_id, payload.name, hash_token(token), MAIN_COUNTER_ID, now_iso()),
         )
         audit(conn, f"staff:{staff_id}", "staff_created", "bootstrap")
-    return {"staff_id": staff_id, "name": payload.name, "token": token}
+    membership = transfers.staff_membership(conn, staff_id)
+    return {
+        "staff_id": staff_id,
+        "name": payload.name,
+        "token": token,
+        **membership,
+    }
+
+
+@router.get("/me")
+def whoami(conn: Conn, staff: Staff) -> dict:
+    return transfers.staff_membership(conn, staff["id"])
 
 
 @router.post("/operators", status_code=201)
 def create_staff(
-    payload: StaffCreate, conn: Conn, staff: Staff
+    payload: OperatorCreate, conn: Conn, staff: Staff
 ) -> dict:
     if not staff["is_admin"]:
         raise services.api_error(403, "forbidden", "仅管理员可创建工作人员")
+    counter_id = MAIN_COUNTER_ID
+    if payload.counter_id is not None:
+        counter = transfers.get_counter_by_ref(conn, payload.counter_id)
+        counter_id = counter["id"]
     with transaction(conn):
         staff_id = services.new_id()
         token = new_token()
         conn.execute(
-            "INSERT INTO staff(id, name, token_hash, created_at) VALUES (?,?,?,?)",
-            (staff_id, payload.name, hash_token(token), now_iso()),
+            "INSERT INTO staff(id, name, token_hash, is_admin, counter_id, created_at)"
+            " VALUES (?,?,?,0,?,?)",
+            (staff_id, payload.name, hash_token(token), counter_id, now_iso()),
         )
-        audit(conn, f"staff:{staff['id']}", "staff_created", f"staff_id={staff_id}")
-    return {"staff_id": staff_id, "name": payload.name, "token": token}
+        audit(
+            conn,
+            f"staff:{staff['id']}",
+            "staff_created",
+            f"staff_id={staff_id} counter_id={counter_id}",
+        )
+    return {
+        "staff_id": staff_id,
+        "name": payload.name,
+        "token": token,
+        **transfers.staff_membership(conn, staff_id),
+    }
+
+
+@router.post("/operators/{staff_id}/counter")
+def assign_operator_counter(
+    staff_id: str,
+    payload: StaffCounterUpdate,
+    conn: Conn,
+    staff: Staff,
+) -> dict:
+    if not staff["is_admin"]:
+        raise services.api_error(403, "forbidden", "仅管理员可调整工作人员所属柜台")
+    return transfers.update_staff_counter(conn, staff, staff_id, payload.counter_id)
+
+
+@router.get("/operators")
+def list_operators(conn: Conn, staff: Staff) -> dict:
+    rows = conn.execute(
+        "SELECT id, name, is_admin, counter_id, created_at FROM staff ORDER BY created_at"
+    ).fetchall()
+    return {
+        "operators": [
+            {
+                "staff_id": r["id"],
+                "name": r["name"],
+                "is_admin": bool(r["is_admin"]),
+                "counter": transfers.counter_brief(conn, r["counter_id"]),
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+    }
 
 
 @router.post("/claimants", status_code=201)
@@ -112,8 +172,9 @@ def create_item(payload: ItemCreate, conn: Conn, staff: Staff) -> dict:
         now = now_iso()
         conn.execute(
             "INSERT INTO items(id, public_code, title, public_description, found_at,"
-            " found_location, status, created_by, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,'held',?,?,?)",
+            " found_location, status, custody_state, custody_counter_id,"
+            " created_by, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,'held','at_counter',?,?,?,?)",
             (
                 item_id,
                 public_code,
@@ -121,6 +182,7 @@ def create_item(payload: ItemCreate, conn: Conn, staff: Staff) -> dict:
                 payload.public_description,
                 payload.found_at.isoformat(),
                 payload.found_location,
+                staff["counter_id"],
                 staff["id"],
                 now,
                 now,

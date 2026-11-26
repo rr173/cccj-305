@@ -101,6 +101,45 @@ def get_detail_by_code(conn: sqlite3.Connection, item_id: str, code: str) -> sql
     return row
 
 
+def assert_desk_can_handle_item(
+    conn: sqlite3.Connection, item: sqlite3.Row, staff: sqlite3.Row
+) -> None:
+    """Counter custody gate for bookings and deliveries.
+
+    Eligibility rules are unchanged; this adds the physical-custody rule:
+    only the counter currently holding the item (state ``at_counter``) may
+    process a claim.  In transit / missing / quarantined items and items at
+    another counter are all rejected inside the caller's transaction.
+    """
+    state = item["custody_state"] if "custody_state" in item.keys() else "at_counter"
+    if state != "at_counter":
+        messages = {
+            "in_transit": ("item_in_transit", "失物正在调拨在途，不能办理预约或交付"),
+            "missing": ("item_missing", "失物已登记缺件、尚未找到，不能办理领取"),
+            "quarantined": (
+                "item_quarantined",
+                "失物为错箱隔离状态，清点对上之前不能办理领取",
+            ),
+        }
+        code, message = messages.get(
+            state, ("item_not_at_counter", "失物当前不在可领取柜台")
+        )
+        raise api_error(409, code, message, custody_state=state)
+
+    holder_id = item["custody_counter_id"] if "custody_counter_id" in item.keys() else None
+    staff_counter_id = staff["counter_id"] if "counter_id" in staff.keys() else None
+    if holder_id is not None and staff_counter_id != holder_id:
+        holder = conn.execute(
+            "SELECT id, code, name FROM counters WHERE id = ?", (holder_id,)
+        ).fetchone()
+        raise api_error(
+            403,
+            "wrong_counter",
+            "该失物现由其他柜台保管，只有实际保管柜台能办理领取",
+            holding_counter=None if holder is None else dict(holder),
+        )
+
+
 # --------------------------------------------------------------------------
 # Classification
 # --------------------------------------------------------------------------
@@ -486,6 +525,8 @@ def create_booking(
         item = get_item(conn, item_id)
         if item["status"] != "held":
             raise api_error(409, "item_not_held", "该失物已交付，不能再预约")
+        actor_row = conn.execute("SELECT * FROM staff WHERE id = ?", (staff_id,)).fetchone()
+        assert_desk_can_handle_item(conn, item, actor_row)
         claimant = conn.execute(
             "SELECT * FROM claimants WHERE id = ?", (claimant_id,)
         ).fetchone()
@@ -592,6 +633,9 @@ def deliver(
                 "该失物已交付，不能重复办理",
                 delivered_to_claimant_id=None if existing is None else existing["claimant_id"],
             )
+
+        actor_row = conn.execute("SELECT * FROM staff WHERE id = ?", (staff_id,)).fetchone()
+        assert_desk_can_handle_item(conn, item, actor_row)
 
         booking = conn.execute(
             "SELECT * FROM bookings WHERE item_id = ? AND status = 'active'"
@@ -741,6 +785,14 @@ def staff_item(conn: sqlite3.Connection, item: sqlite3.Row) -> dict[str, Any]:
     delivery = conn.execute(
         "SELECT * FROM deliveries WHERE item_id = ?", (item["id"],)
     ).fetchone()
+    holder = None
+    custody_state = item["custody_state"] if "custody_state" in item.keys() else "at_counter"
+    holder_id = item["custody_counter_id"] if "custody_counter_id" in item.keys() else None
+    if holder_id is not None:
+        counter = conn.execute(
+            "SELECT id, code, name, is_main FROM counters WHERE id = ?", (holder_id,)
+        ).fetchone()
+        holder = None if counter is None else dict(counter)
     return {
         "id": item["id"],
         "public_code": item["public_code"],
@@ -749,6 +801,9 @@ def staff_item(conn: sqlite3.Connection, item: sqlite3.Row) -> dict[str, Any]:
         "found_at": item["found_at"],
         "found_location": item["found_location"],
         "status": item["status"],
+        "custody_state": custody_state,
+        "holding_counter": holder,
+        "claim_processing_available": item["status"] == "held" and custody_state == "at_counter",
         "details": [
             {
                 "id": d["id"],
