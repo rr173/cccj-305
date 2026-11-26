@@ -1,0 +1,109 @@
+"""Request schemas.
+
+Every string field is stripped before validation, matching the comparison
+rule ("remove leading/trailing whitespace").  Unknown fields are rejected so
+that clients cannot accidentally smuggle state (e.g. ``is_public``).
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class InputModel(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+
+class DetailIn(InputModel):
+    code: str = Field(min_length=1, max_length=32)
+    label: str = Field(min_length=1, max_length=100)
+    answer: str = Field(min_length=1, max_length=500)
+
+    @field_validator("code", "label", "answer")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空白")
+        return value
+
+
+class ItemCreate(InputModel):
+    title: str = Field(min_length=1, max_length=120)
+    public_description: str = Field(min_length=1, max_length=2000)
+    found_at: date
+    found_location: str = Field(min_length=1, max_length=200)
+    details: list[DetailIn] = Field(default_factory=list, max_length=50)
+
+    @field_validator("title", "public_description", "found_location")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空白")
+        return value
+
+    def detail_codes(self) -> list[str]:
+        return [d.code for d in self.details]
+
+
+class DetailAdd(DetailIn):
+    pass
+
+
+class CorrectionIn(InputModel):
+    answer: str = Field(min_length=1, max_length=500)
+
+    @field_validator("answer")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空白")
+        return value
+
+
+class StaffCreate(InputModel):
+    name: str = Field(min_length=1, max_length=60)
+
+    @field_validator("name")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空白")
+        return value
+
+
+class ClaimantCreate(InputModel):
+    display_name: str = Field(
+        min_length=1,
+        max_length=60,
+        description="化名即可，请勿填写真实个人数据",
+    )
+
+    @field_validator("display_name")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空白")
+        return value
+
+
+class AnswerSubmit(InputModel):
+    public_code: str = Field(min_length=1, max_length=32)
+    detail_code: str = Field(min_length=1, max_length=32)
+    text: str = Field(min_length=1, max_length=500)
+
+    @field_validator("public_code", "detail_code", "text")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空白")
+        return value
+
+
+class BookingCreate(InputModel):
+    claimant_id: str = Field(min_length=1, max_length=64)
+
+
+class DeliveryCreate(InputModel):
+    claimant_id: str = Field(min_length=1, max_length=64)
