@@ -2,7 +2,50 @@
 
 Python + FastAPI + SQLite 实现的失物招领后端。不含图片识别；所有判断都基于
 工作人员登记的文字细节与认领者提交的文字答案。现已支持**多个失物招领柜台、
-跨柜台装箱调拨、开箱签收与错箱双向清点对上**。
+跨柜台装箱调拨、开箱签收与错箱双向清点对上**，以及**不停业柜台盘点与差异复核**。
+
+## 柜台盘点与差异复核如何落地
+
+盘点在营业中完成，**不锁库存**：盘点期间登记、发箱、签收与领取照常进行。
+每件失物在某一柜台有一次**连续在柜期间**（stay）：登记、入柜到达、错箱对上
+或找回时开始；发箱、交付、签缺件、隔离或确认盘亏时结束。一次“见到”扫描只
+为**同一次连续在柜期间**作证。
+
+| 需求 | 实现 |
+| --- | --- |
+| 工作人员在所属柜台开一轮盘点，每柜最多一轮未结 | `POST /api/staff/stocktakes`；部分唯一索引 `one_open_stocktake_per_counter` 兜底，重复开轮 409 `open_round_exists` |
+| 逐件提交现有失物编号 | `POST /api/staff/stocktakes/{round}/scans`，`item_ref` 接受公开编号 `LF-xxxxxx` 或内部 id |
+| 不锁库存，登记/箱运/签收/认领照常 | 扫描与关轮只读账面；登记、发箱、签收、预约、交付在盘点期间均可用 |
+| 按服务器采纳扫描时的账面状态分类 | `seen`：该件此刻 `held` + `at_counter` + 在本柜 + 未确认盘亏；其余（含未知编号、他柜、在途、缺件、隔离、已交付）记 `off_counter` 并写明 `reason` |
+| 盘外扫描不移动实物归属 | `off_counter` 只落一条扫描事实；`items.custody_*` 不变 |
+| 每次扫描有客户端唯一请求号，本轮同号同内容重送返原结果、同号改内容拒绝 | `stocktake_scans(round_id, request_no)` 唯一；同哈希 200 + `replayed:true`，异内容 409 `scan_content_conflict` |
+| 关轮后不收新扫描，仍可重取原结果 | 关轮后 `POST .../scans` → 409 `round_closed`；`GET .../scans/{request_no}` 或同号重送仍返回原结果（`round_closed:true`） |
+| 关轮时以当时可在本柜领取的实物为准，列出见到/待复核并保留盘外扫描 | `POST .../close`：从关轮瞬间 `held + at_counter + 本柜 + 未盘亏` 的实物生成结算清单，`seen`/`pending_review` 两栏，`off_counter_scans` 单列 |
+| 只有本轮**这一次连续在柜期间**的有效扫描才算见到；先扫到后离柜不报短缺；同件离柜又回本柜要重扫，新登记/入柜的也须扫到 | 结算按每件的开放 stay 匹配扫描：扫描 `stay_id` 必须等于关轮时的 stay；此前期间的扫描不计；关轮时已不在本柜的件既不“见到”也不算短缺 |
+| 已确认未找回的盘亏不重复列为本轮短缺 | 结算候选排除 `inventory_loss_review_id` 非空的件 |
+| 结算清单封存，后续调拨与复核不能改写 | 结算行与关轮同事务写入；`BEFORE UPDATE/DELETE` 触发器 `settlement_sealed` 兜底；复核/找回写入独立只增表 |
+| 待复核由本柜另一位工作人员（不是关轮人）核实实物在柜或确认盘亏 | `POST .../items/{ref}/review`，`outcome` = `confirmed_at_counter` \| `loss_confirmed`；关轮人 403 `reviewer_is_closer`；每项仅一次 409 `already_reviewed` |
+| 结算后这一次在柜已结束，原差异不能再据以确认盘亏 | 复核要求开放 stay 等于结算时 stay，否则 409 `stay_ended_after_settlement` |
+| 确认盘亏时仍可办理的预约一并取消 | 同一事务内取消 `active` 预约，`ended_reason = inventory_loss` |
+| 禁止再次预约、报到、交付或发箱 | `assert_desk_can_handle_item()` 与发箱 `_dispatch_problem()` 均拒绝 409 `item_confirmed_lost`；位置视图 `reason_code = confirmed_lost` |
+| 已发生的报到及接待占用保留 | 取消预约不删除 `reception_checkins`，值班名额仍占用到时段结束 |
+| 找回由本柜登记，重新按原规则办理，不恢复旧预约 | `POST .../items/{ref}/find`：解除盘亏拦截并开新 stay；返回 `old_bookings_restored:false` |
+| 复核和找回记录可查 | 结算视图与轮次视图内含每项 `review`（结论/复核人/时间）与 `find`（找回人/时间/柜台） |
+| 结算、确认盘亏、找回与既有业务并发不留矛盾 | 全部走 `BEGIN IMMEDIATE`；关轮、复核、找回与发箱/交付/报到同事务串行，状态与记录一致 |
+| 差异只向本柜工作人员与管理员开放；认领人只看到自己预约被取消的原因 | `/api/staff/stocktakes/*` 非本柜 403 `wrong_counter`，认领者令牌 401；认领者状态新增 `booking.ended_reason_message`，不含盘点/结算/复核字段 |
+
+### 一次盘点的时间线（关轮前调走不算短缺）
+
+设东门柜台有三件：杯（在架）、伞（在架）、包（关轮前新登记）。开轮时扫到杯，
+随后伞被发往西门并被签收，包一直没扫：
+
+1. 关轮时可在本柜领取的实物只剩杯和包 → 杯 `seen`，包 `pending_review`；
+2. 伞已正常离柜，**不报短缺**，也不在结算清单里；
+3. 结算清单封存；轮次内“盘外扫描”仍单独保留；
+4. 另一位东门工作人员可对包确认盘亏（取消其仍有效的预约并拦截后续办理），
+   或核实其实物仍在柜；
+5. 若包在结算后才被调走，再拿这条差异确认盘亏会被 `stay_ended_after_settlement`
+   拒绝；找回登记会开一次新的在柜期间，下一轮必须重新扫到。
 
 ## 柜台与调拨规则如何落地
 
@@ -211,12 +254,29 @@ curl -X POST localhost:8000/api/staff/items/<item_id>/deliveries \
 # 10) 工作人员按柜台查该时段的预约与办理结果；认领者只看到自己的预约。
 curl "localhost:8000/api/staff/slots/$SLOT/bookings?counter=EAST" -H "$H"
 curl "localhost:8000/api/claimant/items/<public_code>/status" -H "<认领者令牌>"
+
+# 11) 柜台盘点（营业中，不锁库存）：开轮 -> 逐件扫描 -> 关轮封存结算。
+ROUND="$(curl -sX POST localhost:8000/api/staff/stocktakes -H '<东门工作人员令牌>')"
+RID="$(printf '%s' "$ROUND" | python3 -c 'import sys,json;print(json.load(sys.stdin)["round_id"])')"
+# 每件失物一次扫描；request_no 为客户端唯一请求号，同号同内容重送返原结果。
+curl -X POST "localhost:8000/api/staff/stocktakes/$RID/scans" -H '<东门工作人员令牌>' -H "$J" \
+  -d '{"request_no":"scan-0001","item_ref":"LF-XXXXXX"}'
+# 关轮：按关轮时可在本柜领取的实物生成见到/待复核/盘外扫描清单并封存。
+curl -X POST "localhost:8000/api/staff/stocktakes/$RID/close" -H '<东门工作人员令牌>'
+curl "localhost:8000/api/staff/stocktakes/$RID/settlement" -H '<东门工作人员令牌>'
+
+# 12) 差异复核：本柜另一位工作人员核实实物在柜或确认盘亏；找回单独登记。
+curl -X POST "localhost:8000/api/staff/stocktakes/$RID/items/<item_id>/review" \
+  -H '<东门另一位工作人员令牌>' -H "$J" -d '{"outcome":"loss_confirmed"}'
+curl -X POST "localhost:8000/api/staff/stocktakes/$RID/items/<item_id>/find" \
+  -H '<东门另一位工作人员令牌>' -H "$J" -d '{"note":"在库房找到"}'
 ```
 
 可复跑的端到端演示（临时库、全虚构数据，含错箱两种开箱顺序的故事）：
 
 ```bash
 python3 demo/transfer_demo.py
+python3 demo/stocktake_demo.py   # 盘点：扫描、调走不算短缺、复核盘亏与找回
 ```
 
 ## 接口一览
@@ -248,7 +308,16 @@ python3 demo/transfer_demo.py
 | GET | `/api/staff/boxes`、`/api/staff/boxes/{box_no}` | 箱列表 / 发件+签收人+清点结果+错箱配对 |
 | POST | `/api/staff/boxes/{box_no}/receipts` | 目的柜台提交一次开箱签收（扫描清单可为空）；同内容重送 200 |
 | GET | `/api/staff/boxes/{box_no}/receipt` | 原签收单与清点结果 |
-| GET | `/api/staff/items/{id}/location` | 单件当前柜台 / 在途·缺件·隔离·已交付原因 |
+| GET | `/api/staff/items/{id}/location` | 单件当前柜台 / 在途·缺件·隔离·已交付·盘亏原因 |
+| POST | `/api/staff/stocktakes` | 在所属柜台开一轮盘点（每柜最多一轮未结） |
+| GET | `/api/staff/stocktakes?counter=` | 盘点轮次列表（非管理员仅本柜台） |
+| GET | `/api/staff/stocktakes/{round}` | 轮次详情（扫描、计数；关轮后含封存结算） |
+| POST | `/api/staff/stocktakes/{round}/scans` | 提交一次扫描（请求号幂等、分类、关轮后拒收） |
+| GET | `/api/staff/stocktakes/{round}/scans`、`/scans/{request_no}` | 本轮扫描列表 / 按请求号重取原结果 |
+| POST | `/api/staff/stocktakes/{round}/close` | 关轮并封存结算清单（见到/待复核/盘外扫描） |
+| GET | `/api/staff/stocktakes/{round}/settlement` | 封存结算清单（仅关轮后） |
+| POST | `/api/staff/stocktakes/{round}/items/{ref}/review` | 本柜另一人复核待复核项：在柜或盘亏 |
+| POST | `/api/staff/stocktakes/{round}/items/{ref}/find` | 本柜登记找回（解除盘亏拦截，不恢复旧预约） |
 | POST | `/api/staff/claimants` | 创建认领者并发放令牌（化名即可） |
 | POST | `/api/staff/items` | 登记失物与若干私有细节 |
 | GET | `/api/staff/items`、`/{item_id}` | 内部全量视图（含答案与更正记录） |
@@ -273,9 +342,10 @@ python3 demo/transfer_demo.py
 python3 demo/demo.py             # 资格/预约/更正/交付历史
 python3 demo/transfer_demo.py    # 柜台/发箱/错箱隔离与两箱对上/找到柜台交付
 python3 demo/reception_demo.py   # 共用值班人、时段名单、报到与名单缩减
+python3 demo/stocktake_demo.py   # 营业中盘点、关轮封存、盘亏复核与找回
 ```
 
-三个脚本都使用临时 SQLite 文件与“认领者甲/乙/丙（化名）”等虚构数据。
+四个脚本都使用临时 SQLite 文件与“认领者甲/乙/丙（化名）”等虚构数据。
 `demo/demo.py` 依次演示：
 
 1. 工作人员登记失物与三条私有细节；
@@ -295,7 +365,7 @@ python3 demo/reception_demo.py   # 共用值班人、时段名单、报到与名
 python3 -m pytest
 ```
 
-共 68 项测试。原有 23 项覆盖：隐私边界、空白/大小写匹配、公开时点、重送、
+共 82 项测试。原有 23 项覆盖：隐私边界、空白/大小写匹配、公开时点、重送、
 更正永久失效、预约互斥与自动取消、交付复核、交付后历史冻结。
 
 `tests/test_reception_slots.py` 的 19 项额外覆盖接待排班：
@@ -333,6 +403,19 @@ python3 -m pytest
 - 到达后可再次跨柜台转发；
 - 公网/认领者接口不出现箱号、`quarantined/missing`、隔离/缺件/错箱等内部清点信息。
 
+`tests/test_stocktakes.py` 的 14 项额外覆盖柜台盘点与差异复核：
+
+- 每柜最多一轮未结、同柜可见/他柜 403/认领者 401、管理员可审阅；
+- 扫描按采纳时账面分类（见到 / 他柜、在途、缺件、已交付、未知编号为盘外），
+  盘外不移动实物；请求号幂等、改内容 409、关轮后拒收但原结果可重取；
+- 关轮按当时可领取实物封存结算，先扫到后离柜不算短缺，新登记/回归须重扫；
+- 结算清单数据库层只增不改（`settlement_sealed` 触发器）；
+- 复核须本柜另一人且非关轮人、只对 pending、只一次；结算后 stay 已结束则拒绝；
+- 确认盘亏取消仍有效预约并拦截预约/报到/交付/发箱，保留已发生报到；
+- 找回解除拦截并开新 stay，不恢复旧预约；盘亏未找回不重复报短缺；
+- 差异仅本柜与管理员可见，认领者只看到自己预约的取消原因；
+- 旧库升级为在架实物补建 stay。
+
 ## 目录
 
 ```
@@ -344,15 +427,18 @@ app/
   services.py         领域规则（有效性、资格、预约、交付快照、柜台保管门禁、旧预约补约）
   scheduling.py       接待时段、名单、共享人力匹配、报到、名单缩减与到期
   transfers.py        柜台、发箱、签收、错箱双向对上、位置视图
+  stocktakes.py       柜台盘点、扫描分类、关轮封存、差异复核与找回
   routers/
     public.py         公网与认领者接口
     staff.py          工作人员/柜台成员/失物/资格/预约/报到/时段名单/交付
     operations.py     柜台、发箱签收、箱子查询、单件位置
+    stocktakes.py     柜台盘点、扫描、关轮结算、复核与找回
 demo/
   demo.py             两名认领者的端到端演示
   transfer_demo.py    跨柜台调拨与错箱对上演示
   reception_demo.py   共用值班人、时段名单、报到与名单缩减演示
-tests/                规则测试（68 项，可复跑）
+  stocktake_demo.py   营业中盘点、关轮封存、盘亏复核与找回演示
+tests/                规则测试（82 项，可复跑）
 ```
 
 ## 设计说明与边界

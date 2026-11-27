@@ -38,7 +38,7 @@ import sqlite3
 import string
 from typing import Any
 
-from .db import audit, next_seq, now_iso, transaction
+from .db import audit, end_stay, next_seq, now_iso, start_stay, transaction
 from .services import api_error, get_item
 
 # Custody states -------------------------------------------------------------
@@ -271,6 +271,9 @@ def _dispatch_problem(
     if state == QUARANTINED:
         return {**base, "code": "item_quarantined",
                 "message": "该失物为错箱隔离状态，对上之前不能发箱"}
+    if item["inventory_loss_review_id"] is not None:
+        return {**base, "code": "item_confirmed_lost",
+                "message": "该失物经柜台核实确认缺失，找回登记前不能发箱"}
     if item["custody_counter_id"] != sender_counter_id:
         holder = counter_brief(conn, item["custody_counter_id"])
         return {**base, "code": "wrong_counter",
@@ -402,6 +405,7 @@ def dispatch_box(
                 " updated_at = ? WHERE id = ?",
                 (IN_TRANSIT, at, item["id"]),
             )
+            end_stay(conn, item["id"], "dispatched", at)
             _cancel_booking_for_dispatch(conn, item["id"], staff["id"], box_no, at)
 
         audit(
@@ -607,6 +611,7 @@ def submit_receipt(
                     " updated_at = ? WHERE id = ?",
                     (AT_COUNTER, destination_id, at, item_id),
                 )
+                start_stay(conn, item_id, destination_id, "arrived", at)
                 continue
 
             conn.execute(
@@ -619,6 +624,7 @@ def submit_receipt(
                 " updated_at = ? WHERE id = ?",
                 (MISSING, destination_id, at, item_id),
             )
+            end_stay(conn, item_id, "missing", at)
 
             open_find = conn.execute(
                 "SELECT s.id AS scan_id, r.id AS find_receipt_id,"
@@ -679,6 +685,7 @@ def submit_receipt(
                     " updated_at = ? WHERE id = ?",
                     (QUARANTINED, destination_id, at, item["id"]),
                 )
+                end_stay(conn, item["id"], "quarantined", at)
 
         conn.execute(
             "UPDATE boxes SET status = 'received', receipt_id = ? WHERE box_no = ?",
@@ -736,6 +743,7 @@ def _match_find(
         " WHERE id = ?",
         (AT_COUNTER, finder_counter_id, at, item_id),
     )
+    start_stay(conn, item_id, finder_counter_id, "reconciled", at)
     audit(
         conn,
         "system:reconciliation",
@@ -937,6 +945,7 @@ def item_location(conn: sqlite3.Connection, item_id: str) -> dict[str, Any]:
         "reason_message": None,
         "active_trip": None,
         "open_finding": None,
+        "inventory_loss": None,
     }
 
     if item["status"] == "delivered" or delivery is not None:
@@ -951,6 +960,18 @@ def item_location(conn: sqlite3.Connection, item_id: str) -> dict[str, Any]:
 
     state = item["custody_state"]
     if state == AT_COUNTER:
+        if item.keys() and item["inventory_loss_review_id"] is not None:
+            result["claim_processing_available"] = False
+            result["claimable_here"] = False
+            result["reason_code"] = "confirmed_lost"
+            result["reason_message"] = (
+                "柜台核实确认缺失；找回登记前不能预约、报到、交付或发箱。"
+            )
+            result["inventory_loss"] = {
+                "review_id": item["inventory_loss_review_id"],
+                "confirmed_at": item["inventory_loss_at"],
+            }
+            return result
         result["claim_processing_available"] = True
         result["claimable_here"] = True
         result["reason_message"] = "实物在本柜台，可按既有资格规则办理预约与交付。"

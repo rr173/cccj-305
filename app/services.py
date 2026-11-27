@@ -28,7 +28,7 @@ from typing import Any, TypedDict
 
 from fastapi import HTTPException
 
-from .db import audit, next_seq, now_iso, norm, transaction
+from .db import audit, end_stay, next_seq, now_iso, norm, transaction
 
 MIN_PRIVATE_CLUES = 2
 
@@ -109,7 +109,9 @@ def assert_desk_can_handle_item(
     Eligibility rules are unchanged; this adds the physical-custody rule:
     only the counter currently holding the item (state ``at_counter``) may
     process a claim.  In transit / missing / quarantined items and items at
-    another counter are all rejected inside the caller's transaction.
+    another counter are all rejected inside the caller's transaction.  An
+    object confirmed as an inventory loss (and not yet found) is likewise
+    blocked until the counter registers a find.
     """
     state = item["custody_state"] if "custody_state" in item.keys() else "at_counter"
     if state != "at_counter":
@@ -125,6 +127,14 @@ def assert_desk_can_handle_item(
             state, ("item_not_at_counter", "失物当前不在可领取柜台")
         )
         raise api_error(409, code, message, custody_state=state)
+
+    if "inventory_loss_review_id" in item.keys() and item["inventory_loss_review_id"] is not None:
+        raise api_error(
+            409,
+            "item_confirmed_lost",
+            "该失物经柜台核实确认缺失，找回登记前不能预约、报到、交付或发箱",
+            inventory_loss_review_id=item["inventory_loss_review_id"],
+        )
 
     holder_id = item["custody_counter_id"] if "custody_counter_id" in item.keys() else None
     staff_counter_id = staff["counter_id"] if "counter_id" in staff.keys() else None
@@ -321,12 +331,24 @@ def claimant_item_status(
         checkin = conn.execute(
             "SELECT id FROM reception_checkins WHERE booking_id = ?", (booking["id"],)
         ).fetchone()
+        ended_reason_message = None
+        if ended_reason in ("inventory_loss", "item_dispatched", "roster_changed",
+                            "slot_ended", "eligibility_lost"):
+            ended_reason_message = {
+                "inventory_loss": "该失物经柜台核实确认缺失，预约已取消；"
+                "如找回请重新预约。",
+                "item_dispatched": "该失物已调拨离柜，原预约已取消。",
+                "roster_changed": "接待排班调整，原预约已取消。",
+                "slot_ended": "接待时段已结束且未交付，预约已结束。",
+                "eligibility_lost": "有效私有线索不足，预约已取消。",
+            }[ended_reason]
         booking_view = {
             "id": booking["id"],
             "status": status,
             "created_at": booking["created_at"],
             "ended_at": booking["ended_at"],
             "ended_reason": ended_reason,
+            "ended_reason_message": ended_reason_message,
             # The claimant may see where and when to come, but never the
             # internal roster or which specific person will receive them
             # before they actually check in.
@@ -900,6 +922,7 @@ def deliver(
                     "UPDATE items SET status = 'delivered', updated_at = ? WHERE id = ?",
                     (at, item_id),
                 )
+                end_stay(conn, item_id, "delivered", at)
                 audit(
                     conn,
                     f"staff:{staff_id}",
@@ -981,7 +1004,25 @@ def staff_item(conn: sqlite3.Connection, item: sqlite3.Row) -> dict[str, Any]:
         "status": item["status"],
         "custody_state": custody_state,
         "holding_counter": holder,
-        "claim_processing_available": item["status"] == "held" and custody_state == "at_counter",
+        "claim_processing_available": (
+            item["status"] == "held"
+            and custody_state == "at_counter"
+            and (
+                "inventory_loss_review_id" not in item.keys()
+                or item["inventory_loss_review_id"] is None
+            )
+        ),
+        "inventory_loss": (
+            None
+            if "inventory_loss_review_id" not in item.keys()
+            or item["inventory_loss_review_id"] is None
+            else {
+                "review_id": item["inventory_loss_review_id"],
+                "confirmed_at": item["inventory_loss_at"],
+                "blocked": True,
+                "note": "柜台核实确认缺失；找回登记前不能预约、报到、交付或发箱。",
+            }
+        ),
         "details": [
             {
                 "id": d["id"],

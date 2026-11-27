@@ -198,3 +198,35 @@ class LegacySlotAssign(InputModel):
 
 class DeliveryCreate(InputModel):
     claimant_id: str = Field(min_length=1, max_length=64)
+
+
+class StocktakeScanCreate(InputModel):
+    # Client-generated unique idempotency key within the round.
+    request_no: str = Field(min_length=1, max_length=64)
+    # Public item code or internal id.  Unknown codes are accepted and
+    # classified as an off-counter scan (they never abort the round).
+    item_ref: str = Field(min_length=1, max_length=64)
+
+    @field_validator("request_no", "item_ref")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空白")
+        return value
+
+
+class StocktakeReviewCreate(InputModel):
+    # confirmed_at_counter | loss_confirmed
+    outcome: str = Field(min_length=1, max_length=32)
+    note: str = Field(default="", max_length=1000)
+
+    @field_validator("outcome")
+    @classmethod
+    def known_outcome(cls, value: str) -> str:
+        if value not in ("confirmed_at_counter", "loss_confirmed"):
+            raise ValueError("outcome 只能是 confirmed_at_counter 或 loss_confirmed")
+        return value
+
+
+class StocktakeFindCreate(InputModel):
+    note: str = Field(default="", max_length=1000)

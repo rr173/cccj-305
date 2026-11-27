@@ -14,6 +14,7 @@ from .db import connect, db_path_from_env, init_db
 from .routers.operations import router as operations_router
 from .routers.public import claimant_router, public_router
 from .routers.staff import router as staff_router
+from .routers.stocktakes import router as stocktake_router
 
 
 def create_app(db_path: str | Path | None = None) -> FastAPI:
@@ -59,6 +60,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             code = "label_already_scanned"
         elif "one_open_box_line_per_item" in message:
             code = "item_already_in_open_box"
+        elif "one_open_stocktake_per_counter" in message:
+            code = "open_round_exists"
+        elif "settlement_sealed" in message:
+            code = "settlement_sealed"
         elif "counter_code_taken" in message or "counters.code" in message:
             code = "counter_code_taken"
         return JSONResponse(
@@ -81,6 +86,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     app.include_router(claimant_router)
     app.include_router(staff_router)
     app.include_router(operations_router)
+    app.include_router(stocktake_router)
     return app
 
 

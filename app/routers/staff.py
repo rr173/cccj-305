@@ -29,9 +29,17 @@ from ..schemas import (
     StaffCreate,
 )
 from ..security import current_staff, get_conn, hash_token, new_token
-from ..db import MAIN_COUNTER_ID, audit, now_iso, next_seq, transaction
+from ..db import (
+    MAIN_COUNTER_ID,
+    audit,
+    next_seq,
+    now_iso,
+    start_stay,
+    transaction,
+)
 from .. import services
 from .. import scheduling
+from .. import stocktakes
 from .. import transfers
 
 router = APIRouter(prefix="/api/staff", tags=["staff"])
@@ -208,6 +216,7 @@ def create_item(payload: ItemCreate, conn: Conn, staff: Staff) -> dict:
                     now,
                 ),
             )
+        start_stay(conn, item_id, staff["counter_id"], "registered", now)
         audit(
             conn,
             f"staff:{staff['id']}",

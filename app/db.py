@@ -73,6 +73,11 @@ CREATE TABLE IF NOT EXISTS items (
     -- while quarantined, or the expecting destination when missing.
     -- NULL only while in_transit.
     custody_counter_id TEXT REFERENCES counters(id),
+    -- Set while a stocktake review has confirmed this object as an inventory
+    -- loss and the counter has not registered a find yet.  Cleared on find;
+    -- the historical review/find rows stay in their own tables.
+    inventory_loss_review_id INTEGER,
+    inventory_loss_at  TEXT,
     created_by         TEXT NOT NULL REFERENCES staff(id),
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL
@@ -221,6 +226,152 @@ CREATE TABLE IF NOT EXISTS delivery_evidence (
     epoch_at_submission INTEGER NOT NULL,
     submitted_seq       INTEGER NOT NULL,
     submitted_at        TEXT NOT NULL
+);
+
+-- --------------------------------------------------------------------------
+-- Continuous physical stays at a counter.
+--
+-- A stay is one uninterrupted period during which an object is physically
+-- ``at_counter`` at one counter and can be claimed there.  It starts when the
+-- object is registered, arrives in a box, or is reconciled to the counter
+-- that actually found it; it ends when the object is dispatched, delivered,
+-- or confirmed as an inventory loss.  A stocktake scan only proves presence
+-- for the *current* stay: if the object left and came back, an earlier scan
+-- from the previous stay does not count.
+-- --------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS item_counter_stays (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id        TEXT NOT NULL REFERENCES items(id),
+    counter_id     TEXT NOT NULL REFERENCES counters(id),
+    started_at     TEXT NOT NULL,
+    started_reason TEXT NOT NULL,   -- registered | arrived | reconciled | recovered | migrated
+    ended_at       TEXT,
+    ended_reason   TEXT             -- dispatched | delivered | inventory_loss |
+                                    -- missing | quarantined | superseded
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_stay_per_item
+    ON item_counter_stays(item_id) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_item_counter_stays_counter
+    ON item_counter_stays(counter_id, ended_at);
+CREATE INDEX IF NOT EXISTS idx_item_counter_stays_item
+    ON item_counter_stays(item_id, id);
+
+-- --------------------------------------------------------------------------
+-- Counter stocktakes ("盘点") and discrepancy review.
+--
+-- A counter has at most one open round.  Counting never locks the shelf:
+-- registration, transfers, receipts and claims keep working.  Each scan is
+-- classified once, at the moment the server adopts it, by the book state at
+-- that instant.  Closing a round freezes a settlement list of the objects
+-- claimable at that counter at close time (seen vs. pending review); later
+-- transfers cannot rewrite that list.  Pending items are reviewed by another
+-- staff member of the same counter, either confirming the object is on the
+-- shelf or confirming an inventory loss.  A loss cancels still-usable
+-- bookings and blocks further claim handling until the counter registers a
+-- recovery ("找回").
+-- --------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS stocktakes (
+    id                    TEXT PRIMARY KEY,
+    counter_id            TEXT NOT NULL REFERENCES counters(id),
+    status                TEXT NOT NULL DEFAULT 'open',  -- open | closed
+    opened_by             TEXT NOT NULL REFERENCES staff(id),
+    opened_at             TEXT NOT NULL,
+    closed_by             TEXT REFERENCES staff(id),
+    closed_at             TEXT,
+    claimable_count       INTEGER,
+    seen_count            INTEGER,
+    pending_count         INTEGER,
+    off_counter_scan_count INTEGER,
+    seq                   INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_stocktake_per_counter
+    ON stocktakes(counter_id) WHERE status = 'open';
+
+CREATE TABLE IF NOT EXISTS stocktake_scans (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id                  TEXT NOT NULL REFERENCES stocktakes(id),
+    request_no                TEXT NOT NULL,
+    content_hash              TEXT NOT NULL,
+    raw_ref                   TEXT NOT NULL,
+    item_id                   TEXT REFERENCES items(id),
+    -- The continuous on-shelf stay proven by a "seen" scan; NULL for
+    -- off-counter scans.  A later stay at the same counter needs a new scan.
+    stay_id                   INTEGER REFERENCES item_counter_stays(id),
+    classification            TEXT NOT NULL,  -- seen | off_counter
+    reason                    TEXT NOT NULL,
+    custody_state_at_scan     TEXT,
+    custody_counter_id_at_scan TEXT,
+    adopted_at                TEXT NOT NULL,
+    scanned_by                TEXT NOT NULL REFERENCES staff(id),
+    seq                       INTEGER NOT NULL,
+    UNIQUE (round_id, request_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stocktake_scans_round
+    ON stocktake_scans(round_id, id);
+CREATE INDEX IF NOT EXISTS idx_stocktake_scans_item
+    ON stocktake_scans(item_id, round_id);
+
+CREATE TABLE IF NOT EXISTS stocktake_settlement_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id        TEXT NOT NULL REFERENCES stocktakes(id),
+    item_id         TEXT NOT NULL REFERENCES items(id),
+    stay_id         INTEGER NOT NULL REFERENCES item_counter_stays(id),
+    public_code     TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    classification  TEXT NOT NULL,   -- seen | pending_review
+    first_seen_at   TEXT,
+    first_seen_scan_id INTEGER,
+    seen_scan_count INTEGER NOT NULL DEFAULT 0,
+    settled_at      TEXT NOT NULL,
+    UNIQUE (round_id, item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stocktake_settlement_round
+    ON stocktake_settlement_items(round_id, id);
+
+-- The settlement list is sealed: reviews/finds live in their own append-only
+-- tables and never rewrite what was seen or pending at close time.
+CREATE TRIGGER IF NOT EXISTS stocktake_settlement_items_sealed_update
+BEFORE UPDATE ON stocktake_settlement_items
+BEGIN
+    SELECT RAISE(ABORT, 'settlement_sealed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS stocktake_settlement_items_sealed_delete
+BEFORE DELETE ON stocktake_settlement_items
+BEGIN
+    SELECT RAISE(ABORT, 'settlement_sealed');
+END;
+
+CREATE TABLE IF NOT EXISTS stocktake_reviews (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id            TEXT NOT NULL REFERENCES stocktakes(id),
+    settlement_item_id  INTEGER NOT NULL UNIQUE
+                        REFERENCES stocktake_settlement_items(id),
+    item_id             TEXT NOT NULL REFERENCES items(id),
+    outcome             TEXT NOT NULL,   -- confirmed_at_counter | loss_confirmed
+    reviewer_id         TEXT NOT NULL REFERENCES staff(id),
+    reviewed_at         TEXT NOT NULL,
+    note                TEXT NOT NULL DEFAULT '',
+    seq                 INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stocktake_finds (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id            TEXT NOT NULL REFERENCES stocktakes(id),
+    settlement_item_id  INTEGER NOT NULL UNIQUE
+                        REFERENCES stocktake_settlement_items(id),
+    item_id             TEXT NOT NULL REFERENCES items(id),
+    counter_id          TEXT NOT NULL REFERENCES counters(id),
+    found_by            TEXT NOT NULL REFERENCES staff(id),
+    found_at            TEXT NOT NULL,
+    note                TEXT NOT NULL DEFAULT '',
+    seq                 INTEGER NOT NULL
 );
 
 -- --------------------------------------------------------------------------
@@ -406,6 +557,10 @@ def migrate(conn: sqlite3.Connection) -> None:
             "UPDATE items SET custody_counter_id = 'cnt_main' "
             "WHERE custody_counter_id IS NULL"
         )
+    if "inventory_loss_review_id" not in item_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN inventory_loss_review_id INTEGER")
+    if "inventory_loss_at" not in item_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN inventory_loss_at TEXT")
 
     booking_cols = _table_columns(conn, "bookings")
     if "slot_id" not in booking_cols:
@@ -417,6 +572,70 @@ def migrate(conn: sqlite3.Connection) -> None:
     for column in ("booking_id", "slot_id", "reception_staff_id", "counter_id"):
         if column not in delivery_cols:
             conn.execute(f"ALTER TABLE deliveries ADD COLUMN {column} TEXT")
+
+    # Stamp one continuous stay for every object that is physically on a
+    # counter shelf and still claimable, but has no stay row yet (fresh install
+    # or upgrade from a database that predates stocktakes).  Delivered items
+    # and objects blocked by a confirmed inventory loss are deliberately
+    # skipped: their on-shelf stay has already ended.
+    conn.execute(
+        "INSERT INTO item_counter_stays"
+        " (item_id, counter_id, started_at, started_reason)"
+        " SELECT i.id, i.custody_counter_id, i.updated_at, 'migrated'"
+        "   FROM items i"
+        "  WHERE i.custody_state = 'at_counter'"
+        "    AND i.status = 'held'"
+        "    AND i.inventory_loss_review_id IS NULL"
+        "    AND i.custody_counter_id IS NOT NULL"
+        "    AND NOT EXISTS ("
+        "        SELECT 1 FROM item_counter_stays s WHERE s.item_id = i.id"
+        "    )"
+    )
+
+
+def open_stay(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM item_counter_stays WHERE item_id = ? AND ended_at IS NULL",
+        (item_id,),
+    ).fetchone()
+
+
+def start_stay(
+    conn: sqlite3.Connection,
+    item_id: str,
+    counter_id: str,
+    reason: str,
+    at: str | None = None,
+) -> int:
+    """Open a new continuous stay, closing any already-open one first.
+
+    Returns the new stay id.  Must run inside the caller's transaction.
+    """
+    at = at or now_iso()
+    current = open_stay(conn, item_id)
+    if current is not None:
+        if current["counter_id"] == counter_id and current["started_reason"] == reason:
+            # Defensive: already the same stay; do not churn history.
+            return int(current["id"])
+        conn.execute(
+            "UPDATE item_counter_stays SET ended_at = ?, ended_reason = 'superseded'"
+            " WHERE id = ?",
+            (at, current["id"]),
+        )
+    cur = conn.execute(
+        "INSERT INTO item_counter_stays(item_id, counter_id, started_at, started_reason)"
+        " VALUES (?,?,?,?)",
+        (item_id, counter_id, at, reason),
+    )
+    return int(cur.lastrowid)
+
+
+def end_stay(conn: sqlite3.Connection, item_id: str, reason: str, at: str | None = None) -> None:
+    conn.execute(
+        "UPDATE item_counter_stays SET ended_at = ?, ended_reason = ?"
+        " WHERE item_id = ? AND ended_at IS NULL",
+        (at or now_iso(), reason, item_id),
+    )
 
 
 @contextmanager
